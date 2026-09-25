@@ -10,12 +10,13 @@ nonisolated struct ClientInfo: Identifiable, Equatable {
     var id: String { clientId }
 }
 
-// 输出条目类型：stdout/stderr 为命令输出，system 为本地系统消息，command 为输入回显
+// 输出条目类型：stdout/stderr 为命令输出，system 为本地系统消息，command 为输入回显，separator 为每次交互结束的分隔线
 nonisolated enum OutputKind: Equatable {
     case stdout
     case stderr
     case system
     case command
+    case separator
 }
 
 nonisolated struct OutputLine: Identifiable {
@@ -24,14 +25,14 @@ nonisolated struct OutputLine: Identifiable {
     var text: String
 }
 
-// 收到的消息（已按 type 分发）
+// 收到的消息（已按 type 分发）；client 响应均带 targetId（= 来源 client 的 id），用于按客户端分流输出
 nonisolated enum IncomingMessage {
     case registered(ok: Bool, error: String?)
     case clients([ClientInfo])
-    case execOutput(reqId: String, stream: String, data: String)
-    case execExit(reqId: String, code: Int?)
-    case fileContent(content: String?, error: String?)
-    case done(ok: Bool, error: String?)
+    case execOutput(reqId: String, stream: String, data: String, targetId: String)
+    case execExit(reqId: String, code: Int?, targetId: String)
+    case fileContent(content: String?, error: String?, targetId: String)
+    case done(ok: Bool, error: String?, targetId: String)
     case error(message: String)
 
     static func parse(_ text: String) -> IncomingMessage? {
@@ -58,21 +59,28 @@ nonisolated enum IncomingMessage {
             return .execOutput(
                 reqId: obj["reqId"] as? String ?? "",
                 stream: obj["stream"] as? String ?? "stdout",
-                data: obj["data"] as? String ?? ""
+                data: obj["data"] as? String ?? "",
+                targetId: obj["targetId"] as? String ?? ""
             )
         case "exec-exit":
             let code: Int?
             if let c = obj["code"] as? Int { code = c } else { code = nil }
-            return .execExit(reqId: obj["reqId"] as? String ?? "", code: code)
+            return .execExit(
+                reqId: obj["reqId"] as? String ?? "",
+                code: code,
+                targetId: obj["targetId"] as? String ?? ""
+            )
         case "file-content":
             return .fileContent(
                 content: obj["content"] as? String,
-                error: obj["error"] as? String
+                error: obj["error"] as? String,
+                targetId: obj["targetId"] as? String ?? ""
             )
         case "done":
             return .done(
                 ok: obj["ok"] as? Bool ?? false,
-                error: obj["error"] as? String
+                error: obj["error"] as? String,
+                targetId: obj["targetId"] as? String ?? ""
             )
         case "error":
             return .error(message: obj["message"] as? String ?? "未知错误")

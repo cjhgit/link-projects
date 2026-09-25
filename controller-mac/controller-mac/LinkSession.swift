@@ -54,7 +54,10 @@ final class LinkSession: NSObject, URLSessionWebSocketDelegate {
     }
 
     private(set) var state: ConnectionState = .disconnected
-    private(set) var lines: [OutputLine] = []
+    // 输出按客户端分流（key = clientId，"" 为公共区：连接状态等与具体客户端无关的消息）
+    // 当前查看区由 currentTarget 决定，切换客户端时右侧只显示各自的内容
+    private(set) var outputs: [String: [OutputLine]] = [:]
+    var lines: [OutputLine] { outputs[currentTarget ?? ""] ?? [] }
     private(set) var onlineClients: [ClientInfo] = []
     var currentTarget: String? {
         didSet {
@@ -67,6 +70,7 @@ final class LinkSession: NSObject, URLSessionWebSocketDelegate {
     private var listRequested = false // 用户主动 /list，收到响应时打印详细列表
     private var autoConnected = false // 启动时若已配置 token 只自动连接一次，避免失败后循环重连
     private var initializing = true // init 期间的赋值不触发持久化
+    private var outputReqIds: Set<String> = [] // 收到过输出的请求，exec 结束时据此判断是否 [无输出]
 
     private static let maxLines = 5000
 
@@ -100,16 +104,16 @@ final class LinkSession: NSObject, URLSessionWebSocketDelegate {
         guard state == .disconnected else { return }
         let trimmedToken = token.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmedToken.isEmpty else {
-            append("[缺少 token，请在设置中填写]", .system)
+            append("[缺少 token，请在设置中填写]", .system, to: "")
             return
         }
         guard let url = URL(string: serverURL), url.scheme != nil else {
-            append("[服务器地址无效: \(serverURL)]", .system)
+            append("[服务器地址无效: \(serverURL)]", .system, to: "")
             return
         }
 
         state = .connecting
-        append("[正在连接 \(serverURL)]", .system)
+        append("[正在连接 \(serverURL)]", .system, to: "")
 
         let task = URLSession.shared.webSocketTask(with: url)
         task.delegate = self
@@ -143,7 +147,7 @@ final class LinkSession: NSObject, URLSessionWebSocketDelegate {
             guard let error, let self else { return }
             let message = error.localizedDescription
             Task { @MainActor in
-                self.append("[发送失败] \(message)", .system)
+                self.append("[发送失败] \(message)", .system, to: "")
             }
         }
     }
@@ -174,7 +178,7 @@ final class LinkSession: NSObject, URLSessionWebSocketDelegate {
     private func handleDisconnected(_ reason: String) {
         guard state != .disconnected else { return }
         teardown()
-        append("[与服务器断开连接：\(reason)]", .system)
+        append("[与服务器断开连接：\(reason)]", .system, to: "")
     }
 
     // MARK: - 消息处理
@@ -185,13 +189,13 @@ final class LinkSession: NSObject, URLSessionWebSocketDelegate {
         switch msg {
         case .registered(let ok, let error):
             if !ok {
-                append("[注册被拒绝] \(error ?? "未知错误")", .system)
+                append("[注册被拒绝] \(error ?? "未知错误")", .system, to: "")
                 disconnect()
                 teardown()
                 return
             }
             state = .connected
-            append("[已连接服务器 \(serverURL)]", .system)
+            append("[已连接服务器 \(serverURL)]", .system, to: "")
             send(OutgoingMessage.listClients())
 
         case .clients(let clients):
@@ -216,30 +220,42 @@ final class LinkSession: NSObject, URLSessionWebSocketDelegate {
                     }.joined(separator: "\n")
                     append("在线客户端：\n\(detail)", .system)
                 }
+                appendSeparator()
             } else if !before.isEmpty || state == .connected, before != after {
                 append("[在线客户端: \(after.joined(separator: ", "))]", .system)
             }
 
-        case .execOutput(_, let stream, let data):
-            append(Ansiless.strip(data), stream == "stderr" ? .stderr : .stdout)
+        case .execOutput(let reqId, let stream, let data, let targetId):
+            outputReqIds.insert(reqId)
+            append(Ansiless.strip(data), stream == "stderr" ? .stderr : .stdout, to: targetId)
 
-        case .execExit(_, let code):
+        case .execExit(let reqId, let code, let targetId):
+            // 整个过程没有任何 stdout/stderr 时明确提示，避免误以为卡住
+            if outputReqIds.remove(reqId) == nil {
+                append("[无输出]", .system, to: targetId)
+            }
             if let code, code != 0 {
-                append("[退出码 \(code)]", .system)
+                append("[退出码 \(code)]", .system, to: targetId)
             }
+            appendSeparator(to: targetId)
 
-        case .fileContent(let content, let error):
+        case .fileContent(let content, let error, let targetId):
             if let error {
-                append("[读取失败] \(error)", .system)
+                append("[读取失败] \(error)", .system, to: targetId)
+            } else if Ansiless.strip(content ?? "").trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                append("[无输出]", .system, to: targetId)
             } else {
-                append(Ansiless.strip(content ?? ""), .stdout)
+                append(Ansiless.strip(content ?? ""), .stdout, to: targetId)
             }
+            appendSeparator(to: targetId)
 
-        case .done(let ok, let error):
-            append(ok ? "[写入成功]" : "[写入失败] \(error ?? "")", .system)
+        case .done(let ok, let error, let targetId):
+            append(ok ? "[写入成功]" : "[写入失败] \(error ?? "")", .system, to: targetId)
+            appendSeparator(to: targetId)
 
         case .error(let message):
             append("[错误] \(message)", .system)
+            appendSeparator()
         }
     }
 
@@ -305,7 +321,7 @@ final class LinkSession: NSObject, URLSessionWebSocketDelegate {
                 }
                 send(OutgoingMessage.fileWrite(reqId: newReqId(), targetId: currentTarget!, path: path, content: content))
             case "clear":
-                lines.removeAll()
+                clearOutput()
             case "help":
                 append(
                     """
@@ -343,20 +359,31 @@ final class LinkSession: NSObject, URLSessionWebSocketDelegate {
     }
 
     func clearOutput() {
-        lines.removeAll()
+        // 只清当前查看区（各客户端输出相互独立）
+        outputs[currentTarget ?? ""] = nil
     }
 
-    func append(_ text: String, _ kind: OutputKind) {
+    // to 为 nil 时写入当前查看区；连接生命周期消息传 to: "" 写公共区
+    func append(_ text: String, _ kind: OutputKind, to target: String? = nil) {
+        let key = target ?? currentTarget ?? ""
+        var buffer = outputs[key] ?? []
         // 流式 chunk：与最后一条同类且未以换行结尾时直接续上，保持原始换行结构
-        if var last = lines.last, last.kind == kind, !last.text.hasSuffix("\n"), !text.hasPrefix("\n") {
+        // （separator 独立成行，不参与续接）
+        if var last = buffer.last, last.kind == kind, !last.text.hasSuffix("\n"), !text.hasPrefix("\n") {
             last.text += text
-            lines[lines.count - 1] = last
+            buffer[buffer.count - 1] = last
         } else {
-            lines.append(OutputLine(kind: kind, text: text))
+            buffer.append(OutputLine(kind: kind, text: text))
         }
-        if lines.count > Self.maxLines {
-            lines.removeFirst(lines.count - Self.maxLines)
+        if buffer.count > Self.maxLines {
+            buffer.removeFirst(buffer.count - Self.maxLines)
         }
+        outputs[key] = buffer
+    }
+
+    // 每次交互（命令 / 读写 / 列表）结束时输出，便于区分各次输入输出
+    private func appendSeparator(to target: String? = nil) {
+        append(String(repeating: "─", count: 40), .separator, to: target)
     }
 }
 

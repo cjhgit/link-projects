@@ -112,8 +112,8 @@ private struct ConnectView: View {
         .formStyle(.grouped)
         .frame(maxWidth: 480)
         .overlay(alignment: .bottom) {
-            // 连接失败会弹回本页，最近一条系统提示（失败原因）显示在这里
-            if let lastError = session.lines.last(where: { $0.kind == .system }) {
+            // 连接失败会弹回本页，公共区最近一条系统提示（失败原因）显示在这里
+            if let lastError = (session.outputs[""] ?? []).last(where: { $0.kind == .system }) {
                 Text(lastError.text)
                     .font(.callout)
                     .foregroundStyle(.red)
@@ -177,7 +177,10 @@ private struct TerminalView: View {
             .onChange(of: session.lines.count) { _, _ in
                 scrollToBottom(proxy)
             }
-            .onChange(of: session.lines.last?.text) { _, _ in
+            .onChange(of: session.lines.last?.id) { _, _ in
+                scrollToBottom(proxy)
+            }
+            .onChange(of: session.currentTarget) { _, _ in
                 scrollToBottom(proxy)
             }
         }
@@ -218,6 +221,7 @@ private struct TerminalView: View {
         case .stderr: .red
         case .system: .secondary
         case .command: .accentColor
+        case .separator: Color.secondary.opacity(0.4)
         }
     }
 }
