@@ -69,12 +69,30 @@ ssh <服务器> 'cd /opt/link-server && npm install --omit=dev && nohup node dis
 # 2. 云电脑：拷贝 client 目录
 cd client && npm install && npm run build
 # 先在服务端 clients.json 登记："云电脑名字": "专属token"
-LINK_SERVER=ws://<服务器IP>:9600 LINK_CLIENT_ID=<云电脑名字> \
-  LINK_TOKEN=<该机器专属token> node dist/index.js
+# 配置写入 .env（或 ~/.link-projects/client.env）后：
+npm start          # 后台运行（node dist/index.js 不带命令时等同 start）
 
 # 3. 本地
 cd controller && npm run dev          # .env 里 LINK_TOKEN = 服务端 CONTROLLER_TOKEN
 ```
+
+## client 命令
+
+client 默认**后台运行**（同机单实例），pid 记录在 `~/.link-projects/client.pid`，日志写入 `~/.link-projects/client.log`（带时间戳，status 可直接看最近日志）。
+
+```
+node dist/index.js [命令] [选项]     # 不带命令时默认 start
+
+start     后台启动；已在运行则提示（不重复拉起）
+stop      停止后台进程（先 SIGTERM 优雅退出，5s 未退则 SIGKILL；执行中的命令一并终止）
+status    查看运行状态、当前配置与最近 10 行日志（npm 下需 npm run status）
+restart   重启（修改配置后生效）
+run       前台运行，调试排查用（Ctrl+C 退出）
+
+选项：--server <ws://...> --id <clientId> --token <token>（透传给后台进程，也可用环境变量/.env 配置）
+```
+
+对应 npm 脚本：`npm start` / `npm stop` / `npm restart` / `npm run status`（`status` 与 npm 内置命令重名，需带 `run`）。开发调试：`npm run dev`（前台 tsx 直跑）；dev 模式的后台启停用 `npm run dev:start` / `npm run dev:stop`。
 
 ## controller 使用
 
@@ -99,5 +117,6 @@ cd controller && npm run dev          # .env 里 LINK_TOKEN = 服务端 CONTROLL
 ## 运维备忘
 
 - **更新 server 代码**：本地 `server/` 下 `npm run build`，rsync 同步 `dist/` + `package.json` 后重启进程。
+- **更新 client 代码**：云电脑上 `npm run build && npm restart`。
 - **安全**：分角色 token + 每台 client 独立 token（白名单实时重读）；当前传输为明文 ws，如需公网加密可前置 nginx TLS 或改 wss。
 - **本地代理环境注意**：若本机开启 TUN 模式代理，需将服务器 IP 加入直连规则，否则 WebSocket 连接会被代理干扰。

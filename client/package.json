@@ -4,9 +4,14 @@
   "private": true,
   "description": "远程控制客户端：部署在云电脑（无公网 IP），主动连接服务端并执行指令",
   "scripts": {
-    "dev": "tsx src/index.ts",
+    "dev": "tsx src/index.ts run",
+    "dev:start": "tsx src/index.ts start",
+    "dev:stop": "tsx src/index.ts stop",
     "build": "tsc",
-    "start": "node dist/index.js"
+    "start": "node dist/index.js start",
+    "stop": "node dist/index.js stop",
+    "restart": "node dist/index.js restart",
+    "status": "node dist/index.js status"
   },
   "dependencies": {
     "ws": "^8.18.0"
