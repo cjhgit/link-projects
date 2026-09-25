@@ -28,6 +28,8 @@
 
 所有配置通过环境变量或各目录下的 `.env` 文件提供（复制 `.env.example` 为 `.env` 后填写；`.env` 与 `clients.json` 已被 gitignore，不会提交）。
 
+**controller 通用配置**：推荐把 `LINK_SERVER` / `LINK_TOKEN` 写到 `~/.link-projects/controller.env`，Node 版与 mac 版共用一处，无需各项目单独配置（优先级：环境变量 > 项目 `.env` > 全局文件 > mac 版回落 UserDefaults）。
+
 | 变量 | 用于 | 说明 | 默认 |
 |------|------|------|------|
 | `CONTROLLER_TOKEN` | server | controller 专用 token，生成：`openssl rand -hex 16` | 无，必填 |
@@ -51,8 +53,7 @@ npm install && npm run dev            # 终端1
 cd client && cp .env.example .env     # 填 LINK_TOKEN
 npm install && npm run dev            # 终端2
 
-cd controller && cp .env.example .env # 填 LINK_TOKEN
-npm install && npm run dev            # 终端3
+cd controller && npm install && npm run dev  # 终端3，token 读全局 ~/.link-projects/controller.env
 ```
 
 ### 线上部署
@@ -85,6 +86,15 @@ cd controller && npm run dev          # .env 里 LINK_TOKEN = 服务端 CONTROLL
 /exit                退出
 其他任意输入          作为 shell 命令在客户端执行，stdout 正常显示、stderr 红色、非零退出码提示
 ```
+
+## controller-mac（macOS 图形版）
+
+`controller-mac/` 是功能等价的 macOS 原生控制台（SwiftUI，Xcode 打开 `controller-mac.xcodeproj` 运行）：
+
+- 左侧在线客户端列表（点击即切换目标，等价 `/use`），右侧终端输出 + 命令输入，交互命令与上面一致（另含 `/clear` 清屏，无 `/exit`）
+- 配置默认读 `~/.link-projects/controller.env`（与 Node 版共用；文件存在时界面里改配置会写回该文件，不存在时存 UserDefaults），下次启动自动连接；也支持环境变量 `LINK_SERVER` / `LINK_TOKEN` 临时覆盖
+- 命令行运行：`./run.sh`（杀掉旧进程 → xcodebuild 构建 → 后台启动，日志 `/tmp/controller-mac.log`）
+- 自动剥除 ANSI 颜色码，stderr 红色显示，输出超过 5000 行自动截断
 
 ## 运维备忘
 
