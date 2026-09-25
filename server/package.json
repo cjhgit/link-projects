@@ -1,0 +1,20 @@
+{
+  "name": "link-server",
+  "version": "0.1.0",
+  "private": true,
+  "description": "远程控制中继服务端：部署在公网服务器，转发 controller 与 client 之间的消息",
+  "scripts": {
+    "dev": "tsx src/index.ts",
+    "build": "tsc",
+    "start": "node dist/index.js"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "@types/ws": "^8.5.13",
+    "tsx": "^4.19.0",
+    "typescript": "^5.7.0"
+  }
+}

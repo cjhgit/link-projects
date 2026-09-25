@@ -1,0 +1,4 @@
+{
+  "云电脑的clientId": "该机器的专属token（openssl rand -hex 16 生成）",
+  "another-client": "another-token"
+}
