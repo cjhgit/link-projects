@@ -59,16 +59,31 @@ cd controller && npm install && npm run dev  # 终端3，token 读全局 ~/.link
 ### 线上部署
 
 ```bash
-# 1. 公网服务器：本地编译后同步（rsync 排除 .env / clients.json，服务器上单独配置）
-cd server && npm install && npm run build
-rsync -az --delete server/dist server/package.json server/package-lock.json <服务器>:/opt/link-server/
-scp server/.env server/clients.json <服务器>:/opt/link-server/
-ssh <服务器> 'cd /opt/link-server && npm install --omit=dev && nohup node dist/index.js > server.log 2>&1 &'
+# 1. 公网服务器：从 GitHub 拉取代码部署，systemd 托管（.env / clients.json 只存在于服务器，不进 git）
+ssh <服务器> 'git clone https://github.com/cjhgit/link-projects.git /root/projects/link-projects'
+ssh <服务器> 'cd /root/projects/link-projects/server && npm install && npm run build'
+# 配置 server/.env（CONTROLLER_TOKEN，可选 PORT）与 clients.json（也可之后用 mac 控制端直接管理）
+cat > /etc/systemd/system/link-server.service <<EOF
+[Unit]
+Description=link-projects server (WebSocket relay)
+After=network-online.target
+
+[Service]
+WorkingDirectory=/root/projects/link-projects/server
+ExecStart=<node 绝对路径> dist/index.js
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
+EOF
+systemctl enable --now link-server
 # 安全组放行入方向 TCP 9600
 
-# 2. 云电脑：拷贝 client 目录
-cd client && npm install && npm run build
-# 先在服务端 clients.json 登记："云电脑名字": "专属token"
+# 2. 云电脑：克隆仓库后只需 client 目录
+git clone https://github.com/cjhgit/link-projects.git && cd link-projects/client
+npm install && npm run build
+# 先在服务端登记客户端：mac 控制端点 + 添加（或直接改服务端 clients.json）
 # 配置写入 .env（或 ~/.link-projects/client.env）后：
 npm start          # 后台运行（node dist/index.js 不带命令时等同 start）
 
@@ -119,7 +134,7 @@ run       前台运行，调试排查用（Ctrl+C 退出）
 
 ## 运维备忘
 
-- **更新 server 代码**：本地 `server/` 下 `npm run build`，rsync 同步 `dist/` + `package.json` 后重启进程。客户端管理（白名单增删改）需要 server 为新版，旧版 server 会把管理消息当普通转发而报「客户端不在线」。
+- **更新 server 代码**：服务器上 `cd /root/projects/link-projects && git pull && cd server && npm install && npm run build && systemctl restart link-server`。部署改为从 GitHub 拉取（systemd 托管：开机自启、崩溃自动拉起）；客户端管理（白名单增删改）需要 server 为新版，旧版 server 会把管理消息当普通转发而报「客户端不在线」。
 - **更新 client 代码**：云电脑上 `npm run build && npm restart`。
 - **安全**：分角色 token + 每台 client 独立 token（白名单实时重读）；server 只放行 client 的指令响应类消息（exec-output / exec-exit / file-content / done），client 无法伪造 `clients` / `whitelist` 等服务端消息；当前传输为明文 ws，如需公网加密可前置 nginx TLS 或改 wss。
 - **本地代理环境注意**：若本机开启 TUN 模式代理，需将服务器 IP 加入直连规则，否则 WebSocket 连接会被代理干扰。
