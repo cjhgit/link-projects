@@ -1,12 +1,12 @@
 import SwiftUI
 
 @main struct MyApp: App {
-    @State private var session = LinkSession()
+    @State private var model = AppModel()
 
     var body: some Scene {
         WindowGroup {
             ContentView()
-                .environment(session)
+                .environment(model)
         }
         .windowResizability(.contentMinSize)
     }

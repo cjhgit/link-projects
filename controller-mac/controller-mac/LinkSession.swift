@@ -7,51 +7,11 @@ nonisolated enum ConnectionState: Equatable {
     case connected // ws 已建立且注册成功
 }
 
-// 全局共享配置 ~/.link-projects/controller.env（与 node 版 controller 共用，一处配置）
-// 文件存在时它是唯一持久化位置：界面里改配置会写回该文件；不存在时回落到 UserDefaults
-nonisolated enum SharedConfig {
-    static var exists: Bool {
-        FileManager.default.fileExists(atPath: path.path)
-    }
-
-    private static var path: URL {
-        FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".link-projects/controller.env")
-    }
-
-    static func read() -> [String: String] {
-        guard let text = try? String(contentsOf: path, encoding: .utf8) else { return [:] }
-        var result: [String: String] = [:]
-        for line in text.split(whereSeparator: \.isNewline) {
-            let trimmed = line.trimmingCharacters(in: .whitespaces)
-            guard !trimmed.hasPrefix("#"), let eq = trimmed.firstIndex(of: "=") else { continue }
-            let key = trimmed[..<eq].trimmingCharacters(in: .whitespaces)
-            let value = trimmed[trimmed.index(after: eq)...]
-                .trimmingCharacters(in: .whitespaces)
-                .trimmingCharacters(in: CharacterSet(charactersIn: "\"'"))
-            if !key.isEmpty { result[key] = value }
-        }
-        return result
-    }
-
-    static func write(key: String, value: String) {
-        var dict = read()
-        dict[key] = value
-        let text = dict.sorted { $0.key < $1.key }
-            .map { "\($0.key)=\($0.value)" }
-            .joined(separator: "\n") + "\n"
-        try? text.write(to: path, atomically: true, encoding: .utf8)
-    }
-}
-
-// 连接 + 状态管理，行为对齐 controller/src/index.ts
+// 单个服务端的连接 + 状态管理，行为对齐 controller/src/index.ts
+// 每个服务端一个实例：在线客户端、按客户端分流的输出、目标选择各自独立
 @Observable
 final class LinkSession: NSObject, URLSessionWebSocketDelegate {
-    var serverURL: String {
-        didSet { persist("LINK_SERVER", serverURL) }
-    }
-    var token: String {
-        didSet { persist("LINK_TOKEN", token) }
-    }
+    var server: Server // 编辑服务器时更新，连接时取其 url/token
 
     private(set) var state: ConnectionState = .disconnected
     // 输出按客户端分流（key = clientId，"" 为公共区：连接状态等与具体客户端无关的消息）
@@ -62,7 +22,7 @@ final class LinkSession: NSObject, URLSessionWebSocketDelegate {
     var currentTarget: String? {
         didSet {
             guard !initializing else { return }
-            UserDefaults.standard.set(currentTarget ?? "", forKey: "LINK_TARGET")
+            Self.saveTarget(currentTarget, for: server.id)
         }
     }
 
@@ -73,47 +33,60 @@ final class LinkSession: NSObject, URLSessionWebSocketDelegate {
     private var outputReqIds: Set<String> = [] // 收到过输出的请求，exec 结束时据此判断是否 [无输出]
 
     private static let maxLines = 5000
+    private static let targetsKey = "LINK_TARGETS" // 每个服务端各自记住的目标客户端 [serverId: clientId]
 
-    override init() {
-        // 优先级：环境变量 > ~/.link-projects/controller.env > UserDefaults > 默认值
-        let env = ProcessInfo.processInfo.environment
-        let shared = SharedConfig.read()
-        let defaults = UserDefaults.standard
-        serverURL = env["LINK_SERVER"] ?? shared["LINK_SERVER"]
-            ?? defaults.string(forKey: "LINK_SERVER") ?? "ws://127.0.0.1:9600"
-        token = env["LINK_TOKEN"] ?? shared["LINK_TOKEN"]
-            ?? defaults.string(forKey: "LINK_TOKEN") ?? ""
-        currentTarget = defaults.string(forKey: "LINK_TARGET").flatMap { $0.isEmpty ? nil : $0 }
+    init(server: Server) {
+        self.server = server
+        currentTarget = Self.savedTarget(for: server.id)
         super.init()
         initializing = false
     }
 
-    // 全局共享文件存在时写回它（保持一处配置），否则落到 UserDefaults
-    private func persist(_ key: String, _ value: String) {
-        guard !initializing else { return }
-        if SharedConfig.exists {
-            SharedConfig.write(key: key, value: value)
+    // MARK: - 目标客户端持久化（按服务端独立记忆，切换服务端互不影响）
+
+    private static func savedTargets() -> [String: String] {
+        UserDefaults.standard.dictionary(forKey: targetsKey) as? [String: String] ?? [:]
+    }
+
+    private static func saveTarget(_ target: String?, for serverId: UUID) {
+        var targets = savedTargets()
+        if let target, !target.isEmpty {
+            targets[serverId.uuidString] = target
         } else {
-            UserDefaults.standard.set(value, forKey: key)
+            targets[serverId.uuidString] = nil
         }
+        UserDefaults.standard.set(targets, forKey: targetsKey)
+    }
+
+    private static func savedTarget(for serverId: UUID) -> String? {
+        let value = savedTargets()[serverId.uuidString]
+        return (value?.isEmpty ?? true) ? nil : value
+    }
+
+    static func removeSavedTarget(for server: Server) {
+        saveTarget(nil, for: server.id)
+    }
+
+    static func migrateLegacyTarget(_ target: String, to server: Server) {
+        saveTarget(target, for: server.id)
     }
 
     // MARK: - 连接管理
 
     func connect() {
         guard state == .disconnected else { return }
-        let trimmedToken = token.trimmingCharacters(in: .whitespacesAndNewlines)
+        let trimmedToken = server.token.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmedToken.isEmpty else {
-            append("[缺少 token，请在设置中填写]", .system, to: "")
+            append("[缺少 token，请编辑服务器填写]", .system, to: "")
             return
         }
-        guard let url = URL(string: serverURL), url.scheme != nil else {
-            append("[服务器地址无效: \(serverURL)]", .system, to: "")
+        guard let url = URL(string: server.url), url.scheme != nil else {
+            append("[服务器地址无效: \(server.url)]", .system, to: "")
             return
         }
 
         state = .connecting
-        append("[正在连接 \(serverURL)]", .system, to: "")
+        append("[正在连接 \(server.displayName)]", .system, to: "")
 
         let task = URLSession.shared.webSocketTask(with: url)
         task.delegate = self
@@ -126,9 +99,17 @@ final class LinkSession: NSObject, URLSessionWebSocketDelegate {
         ws?.cancel(with: .normalClosure, reason: nil)
     }
 
-    // 启动时若已有配置则自动连接（仅一次）
+    // 编辑服务器（地址/Token 变更）后重连：disconnect 是异步回调，直接 connect 会被 state 拦截，
+    // 这里先强制复位旧连接再拨新的；旧连接的残余回调由 task 身份校验过滤
+    func reconnect() {
+        ws?.cancel(with: .normalClosure, reason: nil)
+        teardown()
+        connect()
+    }
+
+    // 启动时若已配置则自动连接（仅一次，由 AppModel 对所有服务端统一触发）
     func autoConnectIfNeeded() {
-        if !autoConnected, state == .disconnected, !token.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+        if !autoConnected, state == .disconnected, !server.token.isEmpty {
             autoConnected = true
             connect()
         }
@@ -153,10 +134,12 @@ final class LinkSession: NSObject, URLSessionWebSocketDelegate {
     }
 
     private func receiveNext() {
-        ws?.receive { [weak self] result in
+        guard let task = ws else { return }
+        task.receive { [weak self] result in
             guard let self else { return }
             Task { @MainActor in
-                guard self.state != .disconnected else { return }
+                // 重连后旧连接的回调直接丢弃
+                guard self.ws === task, self.state != .disconnected else { return }
                 switch result {
                 case .success(let message):
                     switch message {
@@ -195,7 +178,7 @@ final class LinkSession: NSObject, URLSessionWebSocketDelegate {
                 return
             }
             state = .connected
-            append("[已连接服务器 \(serverURL)]", .system, to: "")
+            append("[已连接服务器 \(server.displayName)]", .system, to: "")
             send(OutgoingMessage.listClients())
 
         case .clients(let clients):
@@ -396,9 +379,10 @@ extension LinkSession {
         didOpenWithProtocol protocol: String?
     ) {
         Task { @MainActor in
-            guard self.state == .connecting else { return }
+            // 重连后旧连接的回调直接丢弃
+            guard self.state == .connecting, self.ws === webSocketTask else { return }
             let clientId = String(UUID().uuidString.prefix(8))
-            self.send(OutgoingMessage.register(clientId: clientId, token: self.token))
+            self.send(OutgoingMessage.register(clientId: clientId, token: self.server.token))
         }
     }
 
@@ -409,6 +393,7 @@ extension LinkSession {
         reason: Data?
     ) {
         Task { @MainActor in
+            guard self.ws === webSocketTask else { return }
             self.handleDisconnected("连接已关闭")
         }
     }

@@ -28,7 +28,7 @@
 
 所有配置通过环境变量或各目录下的 `.env` 文件提供（复制 `.env.example` 为 `.env` 后填写；`.env` 与 `clients.json` 已被 gitignore，不会提交）。
 
-**controller 通用配置**：推荐把 `LINK_SERVER` / `LINK_TOKEN` 写到 `~/.link-projects/controller.env`，Node 版与 mac 版共用一处，无需各项目单独配置（优先级：环境变量 > 项目 `.env` > 全局文件 > mac 版回落 UserDefaults）。
+**controller 通用配置**：推荐把 `LINK_SERVER` / `LINK_TOKEN` 写到 `~/.link-projects/controller.env`，Node 版每次启动读取（优先级：环境变量 > 项目 `.env` > 全局文件）；mac 版已改为应用内管理多个服务端，首次启动时自动把该文件（或环境变量/旧 UserDefaults）里的单服务端配置迁移为列表第一项，之后不再依赖它。
 
 | 变量 | 用于 | 说明 | 默认 |
 |------|------|------|------|
@@ -109,8 +109,10 @@ run       前台运行，调试排查用（Ctrl+C 退出）
 
 `controller-mac/` 是功能等价的 macOS 原生控制台（SwiftUI，Xcode 打开 `controller-mac.xcodeproj` 运行）：
 
-- 左侧在线客户端列表（点击即切换目标，等价 `/use`），右侧终端输出 + 命令输入，交互命令与上面一致（另含 `/clear` 清屏，无 `/exit`）
-- 配置默认读 `~/.link-projects/controller.env`（与 Node 版共用；文件存在时界面里改配置会写回该文件，不存在时存 UserDefaults），下次启动自动连接；也支持环境变量 `LINK_SERVER` / `LINK_TOKEN` 临时覆盖
+- 支持同时管理多个服务端：左侧服务器列表（+ 添加，右键/`…` 连接、断开、编辑、删除，状态点绿=已连接、黄=连接中），每个服务端一条独立连接，启动时自动连接所有已配置 token 的服务端
+- 客户端归属各自的服务端：中间列只显示当前选中服务端的在线客户端（点击即切换目标，等价 `/use`），右侧终端输出/输入也随之切换，各服务端的目标选择独立记忆
+- 服务端列表存于 UserDefaults；首次启动自动从旧的单服务端配置（`~/.link-projects/controller.env` / 环境变量 / 旧 UserDefaults）迁移
+- 交互命令与上面一致（另含 `/clear` 清屏，无 `/exit`）
 - 命令行运行：`./run.sh`（杀掉旧进程 → xcodebuild 构建 → 后台启动，日志 `/tmp/controller-mac.log`）
 - 自动剥除 ANSI 颜色码，stderr 红色显示，输出超过 5000 行自动截断
 
