@@ -461,6 +461,42 @@ final class LinkSession: NSObject, URLSessionWebSocketDelegate {
         send(OutgoingMessage.fileWrite(reqId: reqId, targetId: target, path: path, content: content))
     }
 
+    /// 在远端新建空文本文件（已存在则失败，不覆盖已有内容）；completion 参数为 nil 表示成功，否则为错误信息
+    func createRemoteFile(path: String, completion: @escaping (String?) -> Void) {
+        guard state == .connected else { return completion("未连接服务器") }
+        guard let target = currentTarget else { return completion("未选择客户端") }
+        let reqId = newReqId()
+        fileCallbacks[reqId] = { reply in
+            switch reply {
+            case .ack(let ok, let error):
+                completion(ok ? nil : (error ?? "新建失败"))
+            case .failure(let error):
+                completion(error)
+            default:
+                completion("意外响应")
+            }
+        }
+        send(OutgoingMessage.fileCreate(reqId: reqId, targetId: target, path: path))
+    }
+
+    /// 删除远程文件或目录（目录递归删除）；completion 参数为 nil 表示成功，否则为错误信息
+    func deleteRemoteFile(path: String, completion: @escaping (String?) -> Void) {
+        guard state == .connected else { return completion("未连接服务器") }
+        guard let target = currentTarget else { return completion("未选择客户端") }
+        let reqId = newReqId()
+        fileCallbacks[reqId] = { reply in
+            switch reply {
+            case .ack(let ok, let error):
+                completion(ok ? nil : (error ?? "删除失败"))
+            case .failure(let error):
+                completion(error)
+            default:
+                completion("意外响应")
+            }
+        }
+        send(OutgoingMessage.fileDelete(reqId: reqId, targetId: target, path: path))
+    }
+
     // MARK: - 客户端白名单管理（发给 server 直接处理，回执经 manageCallbacks 路由）
 
     /// 拉取白名单；completion 参数为 nil 表示成功（列表已更新到 whitelist）

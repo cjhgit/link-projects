@@ -2,7 +2,7 @@ import './env';
 import { WebSocket } from 'ws';
 import { spawn, type ChildProcess } from 'node:child_process';
 import { hostname as osHostname, homedir } from 'node:os';
-import { readFile, writeFile, mkdir, readdir, stat } from 'node:fs/promises';
+import { readFile, writeFile, rm, mkdir, readdir, stat } from 'node:fs/promises';
 import {
   mkdirSync,
   readFileSync,
@@ -17,6 +17,8 @@ import type {
   AnyMsg,
   ExecMsg,
   FileEntry,
+  FileCreateMsg,
+  FileDeleteMsg,
   FileListMsg,
   FileReadMsg,
   FileWriteMsg,
@@ -291,6 +293,10 @@ function connect() {
         return handleFileRead(msg as FileReadMsg);
       case 'file-write':
         return handleFileWrite(msg as FileWriteMsg);
+      case 'file-create':
+        return handleFileCreate(msg as FileCreateMsg);
+      case 'file-delete':
+        return handleFileDelete(msg as FileDeleteMsg);
       case 'file-list':
         return handleFileList(msg as FileListMsg);
     }
@@ -345,6 +351,28 @@ async function handleFileWrite(msg: FileWriteMsg) {
     // 目标目录不存在时自动创建
     await mkdir(dirname(msg.path), { recursive: true });
     await writeFile(msg.path, msg.content, 'utf8');
+    reply({ type: 'done', reqId: msg.reqId, targetId: msg.targetId, ok: true });
+  } catch (err: any) {
+    reply({ type: 'done', reqId: msg.reqId, targetId: msg.targetId, ok: false, error: err.message });
+  }
+}
+
+// 新建空文本文件：wx 标志保证仅在不存在时创建（已存在报 EEXIST，绝不动已有内容）
+async function handleFileCreate(msg: FileCreateMsg) {
+  console.log(`[file-create] ${msg.path}`);
+  try {
+    await writeFile(msg.path, '', { flag: 'wx' });
+    reply({ type: 'done', reqId: msg.reqId, targetId: msg.targetId, ok: true });
+  } catch (err: any) {
+    reply({ type: 'done', reqId: msg.reqId, targetId: msg.targetId, ok: false, error: err.message });
+  }
+}
+
+// 删除文件或目录（目录递归删除；force 默认 false，路径不存在时报错）
+async function handleFileDelete(msg: FileDeleteMsg) {
+  console.log(`[file-delete] ${msg.path}`);
+  try {
+    await rm(msg.path, { recursive: true });
     reply({ type: 'done', reqId: msg.reqId, targetId: msg.targetId, ok: true });
   } catch (err: any) {
     reply({ type: 'done', reqId: msg.reqId, targetId: msg.targetId, ok: false, error: err.message });

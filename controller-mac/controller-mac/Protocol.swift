@@ -196,6 +196,14 @@ nonisolated enum OutgoingMessage {
         json(["type": "file-write", "reqId": reqId, "targetId": targetId, "path": path, "content": content])
     }
 
+    static func fileCreate(reqId: String, targetId: String, path: String) -> String {
+        json(["type": "file-create", "reqId": reqId, "targetId": targetId, "path": path])
+    }
+
+    static func fileDelete(reqId: String, targetId: String, path: String) -> String {
+        json(["type": "file-delete", "reqId": reqId, "targetId": targetId, "path": path])
+    }
+
     static func fileList(reqId: String, targetId: String, path: String) -> String {
         json(["type": "file-list", "reqId": reqId, "targetId": targetId, "path": path])
     }

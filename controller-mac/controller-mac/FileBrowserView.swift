@@ -45,6 +45,10 @@ struct FileBrowserView: View {
     @State private var pathInput = "" // 路径输入框，与当前目录同步，可手动跳转
     @State private var viewer: FileViewerSheet?
     @State private var showHidden = false
+    @State private var showCreateFile = false // 新建文本文件弹窗
+    @State private var newFileName = ""
+    @State private var confirmDelete = false // 删除确认弹窗
+    @State private var entryPendingDelete: FileEntryInfo?
 
     struct FileViewerSheet: Identifiable {
         let path: String
@@ -92,6 +96,25 @@ struct FileBrowserView: View {
                     // 查看器可能保存过文件（大小/时间变化），关闭后刷新当前目录
                     if !path.isEmpty { load(path) }
                 }
+        }
+        .alert("新建文本文件", isPresented: $showCreateFile) {
+            TextField("文件名", text: $newFileName)
+            Button("创建") { createFile(named: newFileName) }
+            Button("取消", role: .cancel) {}
+        } message: {
+            Text("在当前目录创建空文件，同名文件或目录已存在时会失败")
+        }
+        .confirmationDialog(
+            "删除",
+            isPresented: $confirmDelete,
+            presenting: entryPendingDelete
+        ) { entry in
+            Button("删除“\(entry.name)”", role: .destructive) { deleteEntry(entry) }
+            Button("取消", role: .cancel) {}
+        } message: { entry in
+            Text(entry.kind == .dir
+                ? "目录“\(entry.name)”及其全部内容将被递归删除，此操作不可恢复"
+                : "文件“\(entry.name)”将被删除，此操作不可恢复")
         }
         .onAppear { if path.isEmpty { load("~") } }
         .onChange(of: session.currentTarget) { _, _ in
@@ -147,6 +170,15 @@ struct FileBrowserView: View {
                 }
 
             Button {
+                newFileName = ""
+                showCreateFile = true
+            } label: {
+                Image(systemName: "doc.badge.plus")
+            }
+            .disabled(path.isEmpty || loading)
+            .help("新建文本文件")
+
+            Button {
                 if !path.isEmpty { load(path) }
             } label: {
                 Image(systemName: "arrow.clockwise")
@@ -190,6 +222,11 @@ struct FileBrowserView: View {
                         }
                         Divider()
                         Button("拷贝路径") { copy((path as NSString).appendingPathComponent(entry.name)) }
+                        Divider()
+                        Button("删除…", role: .destructive) {
+                            entryPendingDelete = entry
+                            confirmDelete = true
+                        }
                     }
             }
         }
@@ -254,6 +291,38 @@ struct FileBrowserView: View {
                 // 失败时保留原目录内容，用户可继续操作或修改路径
                 errorMessage = "读取 \(newPath) 失败：\(error)"
                 if path.isEmpty { pathInput = newPath }
+            }
+        }
+    }
+
+    // MARK: 新建 / 删除
+
+    private func createFile(named rawName: String) {
+        let name = rawName.trimmingCharacters(in: .whitespacesAndNewlines)
+        // 只允许在当前目录下按文件名创建（含分隔符或目录引用的输入直接拒绝）
+        guard !name.isEmpty, !name.contains("/"), name != ".", name != ".." else {
+            errorMessage = "文件名无效：\(name.isEmpty ? "为空" : name)"
+            return
+        }
+        let full = (path as NSString).appendingPathComponent(name)
+        session.createRemoteFile(path: full) { error in
+            if let error {
+                errorMessage = "新建 \(name) 失败：\(error)"
+            } else {
+                // 刷新目录并直接打开编辑器（新建文本文件后通常要立即写内容）
+                load(path)
+                viewer = FileViewerSheet(path: full)
+            }
+        }
+    }
+
+    private func deleteEntry(_ entry: FileEntryInfo) {
+        let full = (path as NSString).appendingPathComponent(entry.name)
+        session.deleteRemoteFile(path: full) { error in
+            if let error {
+                errorMessage = "删除 \(entry.name) 失败：\(error)"
+            } else {
+                load(path)
             }
         }
     }

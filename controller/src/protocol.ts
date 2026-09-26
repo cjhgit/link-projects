@@ -86,6 +86,21 @@ export interface DoneMsg {
   error?: string;
 }
 
+// ===== 新建文本文件 / 删除 =====
+export interface FileCreateMsg {
+  type: 'file-create';
+  reqId: string;
+  targetId: string;
+  path: string; // 完整路径；已存在（含同名目录）则失败，不覆盖已有内容
+}
+
+export interface FileDeleteMsg {
+  type: 'file-delete';
+  reqId: string;
+  targetId: string;
+  path: string; // 文件或目录，目录递归删除
+}
+
 // ===== 目录浏览 =====
 export interface FileEntry {
   name: string;
@@ -161,6 +176,8 @@ export type ServerMsg =
   | ExecMsg
   | FileReadMsg
   | FileWriteMsg
+  | FileCreateMsg
+  | FileDeleteMsg
   | FileListMsg
   | DoneMsg
   | WhitelistMsg
