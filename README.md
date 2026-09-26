@@ -35,6 +35,7 @@
 | `CONTROLLER_TOKEN` | server | controller 专用 token，生成：`openssl rand -hex 16` | 无，必填 |
 | `PORT` | server | ws:// 明文监听端口（云服务器安全组需放行） | 9600 |
 | `CLIENTS_FILE` | server | client 白名单文件路径 | `<项目根>/clients.json` |
+| `ALLOW_SERVER_FILES` | server | 是否允许 controller 浏览服务器本机文件（`@server` 目标），设 `0` 禁用 | `1`（允许） |
 | `TLS_PORT` | server | wss:// 加密监听端口，配置 `TLS_CERT`+`TLS_KEY` 后启用，与 ws 并存（安全组需放行） | 9601 |
 | `TLS_CERT` | server | TLS 证书路径（含完整链），与 `TLS_KEY` 同时配置才生效 | 无 |
 | `TLS_KEY` | server | TLS 私钥路径 | 无 |
@@ -130,6 +131,7 @@ run       前台运行，调试排查用（Ctrl+C 退出）
 - 支持同时管理多个服务端：左侧服务器列表（+ 添加，右键/`…` 连接、断开、编辑、删除，状态点绿=已连接、黄=连接中），每个服务端一条独立连接，启动时自动连接所有已配置 token 的服务端
 - **客户端列表 = 白名单全体**：中间列显示当前选中服务端的全部登记客户端（在线只是状态：绿点=在线、灰点=离线，点击即设为目标、等价 `/use`），右侧终端输出/输入随之切换，各服务端的目标选择独立记忆；未连接时保留显示上次同步的白名单
 - **客户端管理就地完成**，无需登录服务器：标题栏 `+` 登记新客户端（token 支持随机生成），右键行可编辑、删除（在线连接立即断开，之后无法再注册）、拷贝 ID / Token / 接入配置（.env 三行）；变更经 server 原子写回 `clients.json` 并广播给所有控制端，多端列表自动同步
+- **可浏览服务器本机文件**：客户端列表固定首行「服务器主机」（`@server` 保留目标，`~` 为 server 家目录），选中后「文件」页签即可浏览/查看/编辑/新建/删除 server 上的文件（如直接改 `clients.json`、看日志）；服务器主机不支持执行命令，浏览能力由 server 的 `ALLOW_SERVER_FILES` 控制
 - 服务端列表存于 UserDefaults；首次启动自动从旧的单服务端配置（`~/.link-projects/controller.env` / 环境变量 / 旧 UserDefaults）迁移
 - 交互命令与上面一致（另含 `/clear` 清屏，无 `/exit`）
 - 命令行运行：`./run.sh`（杀掉旧进程 → xcodebuild 构建 → 后台启动，日志 `/tmp/controller-mac.log`）
@@ -139,7 +141,7 @@ run       前台运行，调试排查用（Ctrl+C 退出）
 
 `link-ios/` 是功能等价的 iPhone/iPad 控制台（SwiftUI，Xcode 打开 `link-ios.xcodeproj`，连真机运行），方便在手机上随时操作云电脑：
 
-- 功能与 controller-mac 一致：多服务端管理（连接/断开/编辑/删除，启动自动连接）、客户端白名单管理（增删改、token 随机生成、拷贝 ID/Token/接入配置）、终端（`/list` `/use` `/read` `/write` `/clear` `/help` + 任意 shell 命令，输出按客户端分流）、远程文件浏览（目录导航/路径跳转/隐藏文件/新建/删除/查看编辑保存，二进制与超大文件只读）
+- 功能与 controller-mac 一致：多服务端管理（连接/断开/编辑/删除，启动自动连接）、客户端白名单管理（增删改、token 随机生成、拷贝 ID/Token/接入配置）、终端（`/list` `/use` `/read` `/write` `/clear` `/help` + 任意 shell 命令，输出按客户端分流）、远程文件浏览（客户端与服务器本机 `@server`，目录导航/路径跳转/隐藏文件/新建/删除/查看编辑保存，二进制与超大文件只读）
 - 服务端列表存于 UserDefaults（iPhone 沙盒内，不与 mac 版共享）
 - 移动端适配：三栏改为「服务器 → 客户端 → 工作区」push 导航；右键菜单改为长按菜单 + 左滑操作；文件查看器为全屏模态，有未保存修改时禁止下滑关闭；键盘上方提供清屏/收起键盘工具条
 - 回到前台自动重连被系统断开的连接（锁屏/切后台后 ws 易被断开）；手动断开或注册被拒则不打扰
@@ -147,7 +149,7 @@ run       前台运行，调试排查用（Ctrl+C 退出）
 
 ## 运维备忘
 
-- **更新 server 代码**：服务器上 `cd /root/projects/link-projects && git pull && cd server && npm install && npm run build && systemctl restart link-server`。部署改为从 GitHub 拉取（systemd 托管：开机自启、崩溃自动拉起）；客户端管理（白名单增删改）需要 server 为新版，旧版 server 会把管理消息当普通转发而报「客户端不在线」。
+- **更新 server 代码**：服务器上 `cd /root/projects/link-projects && git pull && cd server && npm install && npm run build && systemctl restart link-server`。部署改为从 GitHub 拉取（systemd 托管：开机自启、崩溃自动拉起）；客户端管理（白名单增删改）与服务器本机文件浏览（`@server`）需要 server 为新版，旧版 server 会把这些消息当普通转发而报「客户端不在线」。
 - **更新 client 代码**：云电脑上 `npm run build && npm restart`。
 - **安全**：分角色 token + 每台 client 独立 token（白名单实时重读）；server 只放行 client 的指令响应类消息（exec-output / exec-exit / file-content / done），client 无法伪造 `clients` / `whitelist` 等服务端消息；当前传输为明文 ws，如需公网加密可前置 nginx TLS 或改 wss。
 - **本地代理环境注意**：若本机开启 TUN 模式代理，需将服务器 IP 加入直连规则，否则 WebSocket 连接会被代理干扰。

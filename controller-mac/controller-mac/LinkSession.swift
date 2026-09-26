@@ -11,6 +11,9 @@ nonisolated enum ConnectionState: Equatable {
 // 每个服务端一个实例：在线客户端、按客户端分流的输出、目标选择各自独立
 @Observable
 final class LinkSession: NSObject, URLSessionWebSocketDelegate {
+    // 保留目标：指向 server 本机（文件页签浏览服务器文件），server 端拦截不转发
+    static let serverTargetId = "@server"
+
     var server: Server // 编辑服务器时更新，连接时取其 url/token
 
     private(set) var state: ConnectionState = .disconnected
@@ -204,9 +207,9 @@ final class LinkSession: NSObject, URLSessionWebSocketDelegate {
             let after = clients.map(\.clientId)
             onlineClients = clients
             // 统一列表后目标可指向离线客户端（行仍可见），仅当其被移出白名单时才重置；
-            // 还没选且只有一台在线时自动选择
+            // 保留目标 @server 不参与该重置；还没选且只有一台在线时自动选择
             let whitelistIds = Set(whitelist.map(\.clientId))
-            if let target = currentTarget, !after.contains(target), !whitelistIds.contains(target) {
+            if let target = currentTarget, target != Self.serverTargetId, !after.contains(target), !whitelistIds.contains(target) {
                 currentTarget = after.count == 1 ? after[0] : nil
             } else if currentTarget == nil, after.count == 1 {
                 currentTarget = after[0]
@@ -396,6 +399,11 @@ final class LinkSession: NSObject, URLSessionWebSocketDelegate {
 
         // 其余输入作为 shell 命令下发
         guard requireTarget() else { return }
+        // 服务器主机仅支持文件浏览（server 端也会拒绝），就地提示更直观
+        if currentTarget == Self.serverTargetId {
+            append("[服务器主机仅支持文件浏览，不支持执行命令]", .system)
+            return
+        }
         send(OutgoingMessage.exec(reqId: newReqId(), targetId: currentTarget!, command: input))
     }
 
@@ -403,6 +411,12 @@ final class LinkSession: NSObject, URLSessionWebSocketDelegate {
         if currentTarget != nil { return true }
         append("[请先用 /use <clientId> 选择客户端，/list 查看在线列表]", .system)
         return false
+    }
+
+    // 目标的展示名：@server 显示为「服务器主机」，其余为 clientId（终端提示符 / 选择提示用）
+    var currentTargetDisplay: String {
+        guard let target = currentTarget else { return "(未选择)" }
+        return target == Self.serverTargetId ? "服务器主机" : target
     }
 
     // MARK: - 文件操作（对当前目标客户端，回执经 fileCallbacks 路由到文件界面）

@@ -31,7 +31,7 @@ struct WorkspaceView: View {
     }
 }
 
-// MARK: - 文件浏览器（浏览当前客户端的目录，双击文件打开查看/编辑）
+// MARK: - 文件浏览器（浏览当前目标的目录：客户端或服务器主机 @server，双击文件打开查看/编辑）
 
 struct FileBrowserView: View {
     let session: LinkSession
@@ -57,7 +57,10 @@ struct FileBrowserView: View {
 
     var body: some View {
         if let target = session.currentTarget {
-            if session.onlineClients.contains(where: { $0.clientId == target }) {
+            if target == LinkSession.serverTargetId {
+                // 服务器主机目标：浏览 server 本机文件，连接着即可（本视图只在已连接的工作区显示）
+                browser
+            } else if session.onlineClients.contains(where: { $0.clientId == target }) {
                 browser
             } else {
                 ContentUnavailableView(

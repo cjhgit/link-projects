@@ -146,11 +146,16 @@ private struct ClientSidebar: View {
                     set: { id in
                         if let id, id != session.currentTarget {
                             session.currentTarget = id
-                            let online = session.onlineClients.contains { $0.clientId == id }
-                            session.append("[已选择 \(id)\(online ? "" : "（离线）")]", .system)
+                            if id == LinkSession.serverTargetId {
+                                session.append("[已选择 服务器主机，「文件」页签可浏览 server 本机文件]", .system)
+                            } else {
+                                let online = session.onlineClients.contains { $0.clientId == id }
+                                session.append("[已选择 \(id)\(online ? "" : "（离线）")]", .system)
+                            }
                         }
                     }
                 )) {
+                    serverHostRow(session: session)
                     ForEach(rows) { row in
                         clientRow(row, session: session)
                     }
@@ -230,6 +235,35 @@ private struct ClientSidebar: View {
                 description: Text(model.servers.isEmpty ? "请先添加服务器" : "请在左侧选择服务器")
             )
         }
+    }
+
+    // 固定首行：服务器主机（@server 保留目标），选中后「文件」页签即浏览 server 本机文件
+    private func serverHostRow(session: LinkSession) -> some View {
+        HStack(spacing: 6) {
+            Circle()
+                .fill(session.state == .connected ? Color.green : Color.secondary.opacity(0.4))
+                .frame(width: 6, height: 6)
+                .help(session.state == .connected ? "已连接" : "未连接")
+            Image(systemName: "server.rack")
+                .font(.callout)
+                .foregroundStyle(.secondary)
+            Text("服务器主机")
+                .lineLimit(1)
+            if let version = session.serverVersion {
+                Text("v\(version)")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .help("服务端版本")
+            }
+            if session.currentTarget == LinkSession.serverTargetId {
+                Spacer()
+                Image(systemName: "chevron.right")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .tag(LinkSession.serverTargetId)
+        .help("选中后「文件」页签浏览该服务器本机的文件（不支持执行命令）")
     }
 
     private func clientRow(_ row: ClientRow, session: LinkSession) -> some View {
@@ -607,7 +641,7 @@ struct TerminalView: View {
 
     private var inputBar: some View {
         HStack(spacing: 8) {
-            Text("\(session.server.displayName) · \(session.currentTarget ?? "(未选择)")>")
+            Text("\(session.server.displayName) · \(session.currentTargetDisplay)>")
                 .font(.system(.callout, design: .monospaced))
                 .foregroundStyle(.secondary)
                 .lineLimit(1)

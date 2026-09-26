@@ -2,6 +2,8 @@
 // 路由规则：controller 发出的消息带 targetId（目标 client），由 server 转发；
 // client 发出的响应消息原样广播给所有 controller，各自按 reqId 过滤；
 // 白名单管理类消息（*-whitelist / client-*）由 server 直接处理，不转发给 client。
+// 保留目标 @server：文件类消息（file-list/read/write/create/delete）带此 targetId 时同样由 server
+// 就地处理（浏览服务器本机文件，路径即 server 上的路径），响应直接回给发起的 controller。
 
 export interface RegisterMsg {
   type: 'register';

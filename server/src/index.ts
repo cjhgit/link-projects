@@ -2,10 +2,13 @@ import './env';
 import { WebSocketServer, WebSocket } from 'ws';
 import https from 'node:https';
 import { existsSync, readFileSync, writeFileSync, renameSync } from 'node:fs';
-import { join } from 'node:path';
+import { readFile, writeFile, rm, mkdir, readdir, stat } from 'node:fs/promises';
+import { homedir } from 'node:os';
+import { join, dirname } from 'node:path';
 import type {
   AnyMsg,
   RegisterMsg,
+  FileEntry,
 } from './protocol';
 
 const PORT = Number(process.env.PORT || 9600);
@@ -61,6 +64,96 @@ function saveWhitelist(map: Record<string, string>): boolean {
 const clients = new Map<string, WebSocket>();
 // 所有已注册的 controller 连接
 const controllers = new Set<WebSocket>();
+
+// ---------- 服务器本机文件浏览（targetId = @server 保留目标） ----------
+
+// 保留 targetId：controller 的文件类消息带此目标时不转发，由 server 就地处理（浏览服务器本机文件）
+const SERVER_TARGET = '@server';
+// 是否允许浏览服务器本机文件（默认允许；设 0 可禁止，防止 controller token 泄露时波及服务器自身文件）
+const ALLOW_SERVER_FILES = process.env.ALLOW_SERVER_FILES !== '0';
+
+// 服务器本机文件操作响应（结构对齐 client 的同名响应，targetId 固定为 @server）
+function serverReply(ws: WebSocket, msg: any, payload: Record<string, unknown>) {
+  send(ws, { reqId: msg.reqId ?? '', targetId: SERVER_TARGET, ...payload } as AnyMsg);
+}
+
+// 以下五个处理函数与 client/src/index.ts 的同名逻辑保持一致（~ 展开、stat 容错、wx 防覆盖等），
+// 区别仅在于操作的是 server 本机文件系统、响应只回发起的 controller
+
+async function serverFileList(ws: WebSocket, msg: any) {
+  const raw = (msg.path || '').trim() || '~';
+  const target = raw === '~' || raw.startsWith('~/')
+    ? join(homedir(), raw.slice(1))
+    : raw;
+  console.log(`[file-list] @server ${raw} -> ${target}`);
+  try {
+    const dirents = await readdir(target, { withFileTypes: true });
+    const entries: FileEntry[] = await Promise.all(dirents.map(async (d): Promise<FileEntry> => {
+      let kind: FileEntry['kind'] = 'other';
+      let size = 0;
+      let mtime = 0;
+      try {
+        const st = await stat(join(target, d.name));
+        if (st.isDirectory()) kind = 'dir';
+        else if (st.isFile()) { kind = 'file'; size = st.size; }
+        mtime = st.mtimeMs;
+      } catch { /* 保留 other */ }
+      return { name: d.name, kind, size, mtime };
+    }));
+    const order: Record<FileEntry['kind'], number> = { dir: 0, file: 1, other: 2 };
+    entries.sort((a, b) =>
+      order[a.kind] - order[b.kind] ||
+      a.name.localeCompare(b.name, undefined, { numeric: true, sensitivity: 'base' })
+    );
+    serverReply(ws, msg, { type: 'file-listing', path: target, entries });
+  } catch (err: any) {
+    serverReply(ws, msg, { type: 'file-listing', path: target, error: err.message });
+  }
+}
+
+async function serverFileRead(ws: WebSocket, msg: any) {
+  console.log(`[file-read] @server ${msg.path}`);
+  try {
+    const content = await readFile(msg.path, 'utf8');
+    serverReply(ws, msg, { type: 'file-content', path: msg.path, content });
+  } catch (err: any) {
+    serverReply(ws, msg, { type: 'file-content', path: msg.path, error: err.message });
+  }
+}
+
+async function serverFileWrite(ws: WebSocket, msg: any) {
+  console.log(`[file-write] @server ${msg.path} (${String(msg.content ?? '').length} 字符)`);
+  try {
+    // 目标目录不存在时自动创建
+    await mkdir(dirname(msg.path), { recursive: true });
+    await writeFile(msg.path, msg.content, 'utf8');
+    serverReply(ws, msg, { type: 'done', ok: true });
+  } catch (err: any) {
+    serverReply(ws, msg, { type: 'done', ok: false, error: err.message });
+  }
+}
+
+// 新建空文本文件：wx 标志保证仅在不存在时创建，绝不动已有内容
+async function serverFileCreate(ws: WebSocket, msg: any) {
+  console.log(`[file-create] @server ${msg.path}`);
+  try {
+    await writeFile(msg.path, '', { flag: 'wx' });
+    serverReply(ws, msg, { type: 'done', ok: true });
+  } catch (err: any) {
+    serverReply(ws, msg, { type: 'done', ok: false, error: err.message });
+  }
+}
+
+// 删除文件或目录（目录递归删除）
+async function serverFileDelete(ws: WebSocket, msg: any) {
+  console.log(`[file-delete] @server ${msg.path}`);
+  try {
+    await rm(msg.path, { recursive: true });
+    serverReply(ws, msg, { type: 'done', ok: true });
+  } catch (err: any) {
+    serverReply(ws, msg, { type: 'done', ok: false, error: err.message });
+  }
+}
 
 function send(ws: WebSocket, msg: AnyMsg) {
   if (ws.readyState === WebSocket.OPEN) {
@@ -186,6 +279,7 @@ function onConnection(ws: WebSocket) {
       if (!map) return reply(false, '白名单文件读取失败，请先在服务器上检查 clients.json 格式');
       if (msg.type === 'client-add') {
         if (!token) return reply(false, 'token 不能为空');
+        if (clientId === SERVER_TARGET) return reply(false, `客户端 ID ${SERVER_TARGET} 为服务端保留字`);
         if (map[clientId] !== undefined) return reply(false, `客户端 ${clientId} 已存在`);
         map[clientId] = token;
       } else if (msg.type === 'client-update') {
@@ -210,6 +304,21 @@ function onConnection(ws: WebSocket) {
     // controller -> client：按 targetId 转发
     if (role === 'controller' && msg.type !== 'register') {
       const m = msg as any;
+      // 保留目标 @server：文件类消息由 server 就地处理（浏览服务器本机），其余类型拒绝
+      if (m.targetId === SERVER_TARGET) {
+        if (!ALLOW_SERVER_FILES) {
+          return send(ws, { type: 'error', reqId: m.reqId, message: '服务端已禁用本机文件浏览（ALLOW_SERVER_FILES=0）' });
+        }
+        switch (msg.type) {
+          case 'file-list': return serverFileList(ws, m);
+          case 'file-read': return serverFileRead(ws, m);
+          case 'file-write': return serverFileWrite(ws, m);
+          case 'file-create': return serverFileCreate(ws, m);
+          case 'file-delete': return serverFileDelete(ws, m);
+          default:
+            return send(ws, { type: 'error', reqId: m.reqId, message: '服务器主机仅支持文件浏览，不支持执行命令' });
+        }
+      }
       const target = m.targetId ? clients.get(m.targetId) : undefined;
       if (!target) {
         return send(ws, {
