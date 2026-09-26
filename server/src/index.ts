@@ -1,5 +1,6 @@
 import './env';
 import { WebSocketServer, WebSocket } from 'ws';
+import https from 'node:https';
 import { existsSync, readFileSync, writeFileSync, renameSync } from 'node:fs';
 import { join } from 'node:path';
 import type {
@@ -8,6 +9,10 @@ import type {
 } from './protocol';
 
 const PORT = Number(process.env.PORT || 9600);
+// wss（TLS）配置：证书与私钥同时配置时额外监听一个加密端口，与 ws 明文端口并存
+const TLS_CERT = process.env.TLS_CERT || '';
+const TLS_KEY = process.env.TLS_KEY || '';
+const TLS_PORT = Number(process.env.TLS_PORT || 9601);
 // controller 连接专用 token
 const CONTROLLER_TOKEN = process.env.CONTROLLER_TOKEN || '';
 // client 白名单文件（clientId -> 专属 token），默认放在项目根目录
@@ -99,10 +104,8 @@ function broadcastWhitelist() {
   for (const c of controllers) send(c, list);
 }
 
-const wss = new WebSocketServer({ port: PORT });
-console.log(`[server] 监听端口 ${PORT}`);
-
-wss.on('connection', (ws) => {
+// 连接处理：注册鉴权、消息路由，ws 与 wss 两个监听共用
+function onConnection(ws: WebSocket) {
   let role: 'client' | 'controller' | null = null;
   let clientId = '';
 
@@ -242,4 +245,32 @@ wss.on('connection', (ws) => {
   ws.on('error', (err) => {
     console.error(`[ws] 连接错误: ${err.message}`);
   });
-});
+}
+
+const wss = new WebSocketServer({ port: PORT });
+console.log(`[server] 监听端口 ${PORT}（ws://）`);
+wss.on('connection', onConnection);
+
+// wss://（TLS 加密）：client/controller 把地址换成 wss://<证书域名>:<TLS_PORT> 即用
+if (TLS_CERT && TLS_KEY) {
+  try {
+    const httpsServer = https.createServer({
+      cert: readFileSync(TLS_CERT),
+      key: readFileSync(TLS_KEY),
+    });
+    httpsServer.on('error', (err) => {
+      console.error(`[server] wss 监听失败: ${(err as Error).message}`);
+      process.exit(1);
+    });
+    const wssSecure = new WebSocketServer({ server: httpsServer });
+    wssSecure.on('connection', onConnection);
+    httpsServer.listen(TLS_PORT, () => {
+      console.log(`[server] 监听端口 ${TLS_PORT}（wss://，证书 ${TLS_CERT}）`);
+    });
+  } catch (err) {
+    console.error(`[server] wss 启用失败（证书/私钥读取）: ${(err as Error).message}`);
+    process.exit(1);
+  }
+} else if (TLS_CERT || TLS_KEY) {
+  console.warn('[server] TLS_CERT 与 TLS_KEY 需同时配置，未启用 wss');
+}

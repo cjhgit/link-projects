@@ -33,9 +33,12 @@
 | 变量 | 用于 | 说明 | 默认 |
 |------|------|------|------|
 | `CONTROLLER_TOKEN` | server | controller 专用 token，生成：`openssl rand -hex 16` | 无，必填 |
-| `PORT` | server | 监听端口（云服务器安全组需放行） | 9600 |
+| `PORT` | server | ws:// 明文监听端口（云服务器安全组需放行） | 9600 |
 | `CLIENTS_FILE` | server | client 白名单文件路径 | `<项目根>/clients.json` |
-| `LINK_SERVER` | client / controller | server 的 ws 地址 | `ws://127.0.0.1:9600` |
+| `TLS_PORT` | server | wss:// 加密监听端口，配置 `TLS_CERT`+`TLS_KEY` 后启用，与 ws 并存（安全组需放行） | 9601 |
+| `TLS_CERT` | server | TLS 证书路径（含完整链），与 `TLS_KEY` 同时配置才生效 | 无 |
+| `TLS_KEY` | server | TLS 私钥路径 | 无 |
+| `LINK_SERVER` | client / controller | server 的 ws/wss 地址 | `ws://127.0.0.1:9600` |
 | `LINK_TOKEN` | client | 本机专属 token（服务端 clients.json 分配） | 无，必填 |
 | `LINK_TOKEN` | controller | 即服务端的 `CONTROLLER_TOKEN` | 无，必填 |
 | `LINK_CLIENT_ID` | client | 本机唯一标识（clients.json 的 key） | 主机名 |
