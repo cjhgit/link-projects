@@ -84,6 +84,30 @@ export interface DoneMsg {
   error?: string;
 }
 
+// ===== 目录浏览 =====
+export interface FileEntry {
+  name: string;
+  kind: 'dir' | 'file' | 'other'; // other：失效符号链接、设备文件等
+  size: number; // 仅 file 有意义，字节
+  mtime: number; // 修改时间（毫秒），取不到为 0
+}
+
+export interface FileListMsg {
+  type: 'file-list';
+  reqId: string;
+  targetId: string;
+  path: string; // 空或 ~ 表示 client 家目录，开头的 ~ 会展开
+}
+
+export interface FileListingMsg {
+  type: 'file-listing';
+  reqId: string;
+  targetId: string;
+  path: string; // 实际路径（~ 展开后），控制端据此继续导航
+  entries?: FileEntry[]; // 目录在前、同级按名称自然排序
+  error?: string;
+}
+
 export interface ErrorMsg {
   type: 'error';
   reqId?: string;
@@ -128,13 +152,14 @@ export interface ClientRemoveMsg {
   clientId: string;
 }
 
-export type ClientToServerMsg = RegisterMsg | ExecOutputMsg | ExecExitMsg | FileContentMsg | DoneMsg;
+export type ClientToServerMsg = RegisterMsg | ExecOutputMsg | ExecExitMsg | FileContentMsg | FileListingMsg | DoneMsg;
 export type ServerMsg =
   | RegisteredMsg
   | ClientsMsg
   | ExecMsg
   | FileReadMsg
   | FileWriteMsg
+  | FileListMsg
   | DoneMsg
   | WhitelistMsg
   | ErrorMsg;

@@ -35,6 +35,8 @@ final class LinkSession: NSObject, URLSessionWebSocketDelegate {
     private var outputReqIds: Set<String> = [] // 收到过输出的请求，exec 结束时据此判断是否 [无输出]
     // 白名单管理请求的回调（reqId -> 回执），done/error 按此路由到管理界面而非终端
     private var manageCallbacks: [String: (String?) -> Void] = [:]
+    // 文件操作请求的回调（reqId -> 回执），file-listing/file-content/done/error 按此路由到文件界面
+    private var fileCallbacks: [String: (FileReply) -> Void] = [:]
 
     private static let maxLines = 5000
     private static let targetsKey = "LINK_TARGETS" // 每个服务端各自记住的目标客户端 [serverId: clientId]
@@ -127,6 +129,10 @@ final class LinkSession: NSObject, URLSessionWebSocketDelegate {
         let pending = manageCallbacks
         manageCallbacks.removeAll()
         for callback in pending.values { callback("连接已断开") }
+        // 文件操作同理
+        let pendingFiles = fileCallbacks
+        fileCallbacks.removeAll()
+        for callback in pendingFiles.values { callback(.failure("连接已断开")) }
     }
 
     // MARK: - WebSocket 收发
@@ -239,7 +245,19 @@ final class LinkSession: NSObject, URLSessionWebSocketDelegate {
             }
             appendSeparator(to: targetId)
 
-        case .fileContent(let content, let error, let targetId):
+        case .fileContent(let reqId, let content, let error, let targetId):
+            // 文件界面的读取请求：路由到回调，不进终端
+            if let callback = fileCallbacks.removeValue(forKey: reqId) {
+                if let error {
+                    callback(.failure(error))
+                } else if let content {
+                    callback(.content(content))
+                } else {
+                    callback(.failure("空响应"))
+                }
+                return
+            }
+            // 终端 /read 命令
             if let error {
                 append("[读取失败] \(error)", .system, to: targetId)
             } else if Ansiless.strip(content ?? "").trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
@@ -249,10 +267,27 @@ final class LinkSession: NSObject, URLSessionWebSocketDelegate {
             }
             appendSeparator(to: targetId)
 
+        case .fileListing(let reqId, let path, let entries, let error, _):
+            // file-list 只有文件界面发起，响应一律路由到回调
+            if let callback = fileCallbacks.removeValue(forKey: reqId) {
+                if let error {
+                    callback(.failure(error))
+                } else if let entries {
+                    callback(.listing(path: path, entries: entries))
+                } else {
+                    callback(.failure("空响应"))
+                }
+            }
+
         case .done(let reqId, let ok, let error, let targetId):
             // 白名单管理类回执：路由到管理界面，不进终端
             if let callback = manageCallbacks.removeValue(forKey: reqId) {
                 callback(ok ? nil : (error ?? "操作失败"))
+                return
+            }
+            // 文件界面的写入回执
+            if let callback = fileCallbacks.removeValue(forKey: reqId) {
+                callback(.ack(ok: ok, error: error))
                 return
             }
             append(ok ? "[写入成功]" : "[写入失败] \(error ?? "")", .system, to: targetId)
@@ -261,6 +296,10 @@ final class LinkSession: NSObject, URLSessionWebSocketDelegate {
         case .error(let reqId, let message):
             if let reqId, let callback = manageCallbacks.removeValue(forKey: reqId) {
                 callback(message)
+                return
+            }
+            if let reqId, let callback = fileCallbacks.removeValue(forKey: reqId) {
+                callback(.failure(message))
                 return
             }
             append("[错误] \(message)", .system)
@@ -359,6 +398,62 @@ final class LinkSession: NSObject, URLSessionWebSocketDelegate {
         if currentTarget != nil { return true }
         append("[请先用 /use <clientId> 选择客户端，/list 查看在线列表]", .system)
         return false
+    }
+
+    // MARK: - 文件操作（对当前目标客户端，回执经 fileCallbacks 路由到文件界面）
+
+    /// 列出远程目录；path 为空或 ~ 表示客户端家目录，成功返回展开后的实际路径
+    func listFiles(path: String, completion: @escaping (FileOutcome<(path: String, entries: [FileEntryInfo])>) -> Void) {
+        guard state == .connected else { return completion(.failed("未连接服务器")) }
+        guard let target = currentTarget else { return completion(.failed("未选择客户端")) }
+        let reqId = newReqId()
+        fileCallbacks[reqId] = { reply in
+            switch reply {
+            case .listing(let path, let entries):
+                completion(.ok((path, entries)))
+            case .failure(let error):
+                completion(.failed(error))
+            default:
+                completion(.failed("意外响应"))
+            }
+        }
+        send(OutgoingMessage.fileList(reqId: reqId, targetId: target, path: path))
+    }
+
+    /// 读取远程文本文件内容
+    func readRemoteFile(path: String, completion: @escaping (FileOutcome<String>) -> Void) {
+        guard state == .connected else { return completion(.failed("未连接服务器")) }
+        guard let target = currentTarget else { return completion(.failed("未选择客户端")) }
+        let reqId = newReqId()
+        fileCallbacks[reqId] = { reply in
+            switch reply {
+            case .content(let content):
+                completion(.ok(content))
+            case .failure(let error):
+                completion(.failed(error))
+            default:
+                completion(.failed("意外响应"))
+            }
+        }
+        send(OutgoingMessage.fileRead(reqId: reqId, targetId: target, path: path))
+    }
+
+    /// 写入远程文件；completion 参数为 nil 表示成功，否则为错误信息
+    func writeRemoteFile(path: String, content: String, completion: @escaping (String?) -> Void) {
+        guard state == .connected else { return completion("未连接服务器") }
+        guard let target = currentTarget else { return completion("未选择客户端") }
+        let reqId = newReqId()
+        fileCallbacks[reqId] = { reply in
+            switch reply {
+            case .ack(let ok, let error):
+                completion(ok ? nil : (error ?? "写入失败"))
+            case .failure(let error):
+                completion(error)
+            default:
+                completion("意外响应")
+            }
+        }
+        send(OutgoingMessage.fileWrite(reqId: reqId, targetId: target, path: path, content: content))
     }
 
     // MARK: - 客户端白名单管理（发给 server 直接处理，回执经 manageCallbacks 路由）

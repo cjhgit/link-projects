@@ -2,7 +2,7 @@ import './env';
 import { WebSocket } from 'ws';
 import { spawn, type ChildProcess } from 'node:child_process';
 import { hostname as osHostname, homedir } from 'node:os';
-import { readFile, writeFile, mkdir } from 'node:fs/promises';
+import { readFile, writeFile, mkdir, readdir, stat } from 'node:fs/promises';
 import {
   mkdirSync,
   readFileSync,
@@ -16,6 +16,8 @@ import { dirname, join } from 'node:path';
 import type {
   AnyMsg,
   ExecMsg,
+  FileEntry,
+  FileListMsg,
   FileReadMsg,
   FileWriteMsg,
 } from './protocol';
@@ -285,6 +287,8 @@ function connect() {
         return handleFileRead(msg as FileReadMsg);
       case 'file-write':
         return handleFileWrite(msg as FileWriteMsg);
+      case 'file-list':
+        return handleFileList(msg as FileListMsg);
     }
   });
 
@@ -340,6 +344,39 @@ async function handleFileWrite(msg: FileWriteMsg) {
     reply({ type: 'done', reqId: msg.reqId, targetId: msg.targetId, ok: true });
   } catch (err: any) {
     reply({ type: 'done', reqId: msg.reqId, targetId: msg.targetId, ok: false, error: err.message });
+  }
+}
+
+// 目录列举：~ / 空路径展开为家目录；符号链接跟随目标（指向目录的链接可继续进入），
+// 单项 stat 失败（失效链接等）不拖垮整个列表，标记为 other
+async function handleFileList(msg: FileListMsg) {
+  const raw = (msg.path || '').trim() || '~';
+  const target = raw === '~' || raw.startsWith('~/')
+    ? join(homedir(), raw.slice(1))
+    : raw;
+  console.log(`[file-list] ${raw} -> ${target}`);
+  try {
+    const dirents = await readdir(target, { withFileTypes: true });
+    const entries: FileEntry[] = await Promise.all(dirents.map(async (d): Promise<FileEntry> => {
+      let kind: FileEntry['kind'] = 'other';
+      let size = 0;
+      let mtime = 0;
+      try {
+        const st = await stat(join(target, d.name));
+        if (st.isDirectory()) kind = 'dir';
+        else if (st.isFile()) { kind = 'file'; size = st.size; }
+        mtime = st.mtimeMs;
+      } catch { /* 保留 other */ }
+      return { name: d.name, kind, size, mtime };
+    }));
+    const order: Record<FileEntry['kind'], number> = { dir: 0, file: 1, other: 2 };
+    entries.sort((a, b) =>
+      order[a.kind] - order[b.kind] ||
+      a.name.localeCompare(b.name, undefined, { numeric: true, sensitivity: 'base' })
+    );
+    reply({ type: 'file-listing', reqId: msg.reqId, targetId: msg.targetId, path: target, entries });
+  } catch (err: any) {
+    reply({ type: 'file-listing', reqId: msg.reqId, targetId: msg.targetId, path: target, error: err.message });
   }
 }
 

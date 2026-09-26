@@ -27,6 +27,35 @@ nonisolated struct ClientRow: Identifiable, Equatable {
     var id: String { clientId }
 }
 
+// 远程目录条目（client 端 stat 的结果；other 为失效符号链接、设备文件等）
+nonisolated enum FileEntryKind: String, Equatable {
+    case dir
+    case file
+    case other
+}
+
+nonisolated struct FileEntryInfo: Identifiable, Equatable {
+    let name: String
+    let kind: FileEntryKind
+    let size: Double // 字节，仅 file 有意义
+    let mtime: Double // 修改时间（毫秒），0 表示取不到
+    var id: String { name }
+}
+
+// 文件操作请求的响应（fileCallbacks 回调参数）
+nonisolated enum FileReply {
+    case listing(path: String, entries: [FileEntryInfo])
+    case content(String)
+    case ack(ok: Bool, error: String?) // 写入回执
+    case failure(String)
+}
+
+// 文件操作的对外结果（failed 直接携带用户可读的错误文本）
+nonisolated enum FileOutcome<Value> {
+    case ok(Value)
+    case failed(String)
+}
+
 // 输出条目类型：stdout/stderr 为命令输出，system 为本地系统消息，command 为输入回显，separator 为每次交互结束的分隔线
 nonisolated enum OutputKind: Equatable {
     case stdout
@@ -50,7 +79,8 @@ nonisolated enum IncomingMessage {
     case whitelist([WhitelistClient], reqId: String?)
     case execOutput(reqId: String, stream: String, data: String, targetId: String)
     case execExit(reqId: String, code: Int?, targetId: String)
-    case fileContent(content: String?, error: String?, targetId: String)
+    case fileContent(reqId: String, content: String?, error: String?, targetId: String)
+    case fileListing(reqId: String, path: String, entries: [FileEntryInfo]?, error: String?, targetId: String)
     case done(reqId: String, ok: Bool, error: String?, targetId: String)
     case error(reqId: String?, message: String)
 
@@ -100,7 +130,24 @@ nonisolated enum IncomingMessage {
             )
         case "file-content":
             return .fileContent(
+                reqId: obj["reqId"] as? String ?? "",
                 content: obj["content"] as? String,
+                error: obj["error"] as? String,
+                targetId: obj["targetId"] as? String ?? ""
+            )
+        case "file-listing":
+            let entries = (obj["entries"] as? [[String: Any]])?.map {
+                FileEntryInfo(
+                    name: $0["name"] as? String ?? "",
+                    kind: FileEntryKind(rawValue: $0["kind"] as? String ?? "") ?? .other,
+                    size: $0["size"] as? Double ?? 0,
+                    mtime: $0["mtime"] as? Double ?? 0
+                )
+            }
+            return .fileListing(
+                reqId: obj["reqId"] as? String ?? "",
+                path: obj["path"] as? String ?? "",
+                entries: entries,
                 error: obj["error"] as? String,
                 targetId: obj["targetId"] as? String ?? ""
             )
@@ -142,6 +189,10 @@ nonisolated enum OutgoingMessage {
 
     static func fileWrite(reqId: String, targetId: String, path: String, content: String) -> String {
         json(["type": "file-write", "reqId": reqId, "targetId": targetId, "path": path, "content": content])
+    }
+
+    static func fileList(reqId: String, targetId: String, path: String) -> String {
+        json(["type": "file-list", "reqId": reqId, "targetId": targetId, "path": path])
     }
 
     // 白名单管理（server 直接处理，不带 targetId）

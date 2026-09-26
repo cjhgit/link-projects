@@ -298,7 +298,7 @@ private struct DetailView: View {
             }
         } else if let session = model.selectedSession {
             if session.state == .connected {
-                TerminalView(session: session)
+                WorkspaceView(session: session)
             } else {
                 ConnectView(session: session)
             }
@@ -522,7 +522,7 @@ private struct ClientEditView: View {
 
 // MARK: - 终端：输出区 + 输入栏（对应选中的服务端及其目标客户端）
 
-private struct TerminalView: View {
+struct TerminalView: View {
     @Environment(AppModel.self) private var model
     let session: LinkSession
     @State private var input = ""
