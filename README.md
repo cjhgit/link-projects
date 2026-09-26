@@ -135,6 +135,16 @@ run       前台运行，调试排查用（Ctrl+C 退出）
 - 命令行运行：`./run.sh`（杀掉旧进程 → xcodebuild 构建 → 后台启动，日志 `/tmp/controller-mac.log`）
 - 自动剥除 ANSI 颜色码，stderr 红色显示，输出超过 5000 行自动截断
 
+## link-ios（iOS 手机版）
+
+`link-ios/` 是功能等价的 iPhone/iPad 控制台（SwiftUI，Xcode 打开 `link-ios.xcodeproj`，连真机运行），方便在手机上随时操作云电脑：
+
+- 功能与 controller-mac 一致：多服务端管理（连接/断开/编辑/删除，启动自动连接）、客户端白名单管理（增删改、token 随机生成、拷贝 ID/Token/接入配置）、终端（`/list` `/use` `/read` `/write` `/clear` `/help` + 任意 shell 命令，输出按客户端分流）、远程文件浏览（目录导航/路径跳转/隐藏文件/新建/删除/查看编辑保存，二进制与超大文件只读）
+- 服务端列表存于 UserDefaults（iPhone 沙盒内，不与 mac 版共享）
+- 移动端适配：三栏改为「服务器 → 客户端 → 工作区」push 导航；右键菜单改为长按菜单 + 左滑操作；文件查看器为全屏模态，有未保存修改时禁止下滑关闭；键盘上方提供清屏/收起键盘工具条
+- 回到前台自动重连被系统断开的连接（锁屏/切后台后 ws 易被断开）；手动断开或注册被拒则不打扰
+- 部署目标 iOS 26；`Info.plist` 已放开 ATS（自建 ws:// 明文直连；条件允许时建议服务端配 TLS 用 wss:// 接入）
+
 ## 运维备忘
 
 - **更新 server 代码**：服务器上 `cd /root/projects/link-projects && git pull && cd server && npm install && npm run build && systemctl restart link-server`。部署改为从 GitHub 拉取（systemd 托管：开机自启、崩溃自动拉起）；客户端管理（白名单增删改）需要 server 为新版，旧版 server 会把管理消息当普通转发而报「客户端不在线」。
