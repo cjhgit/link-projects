@@ -11,7 +11,7 @@ nonisolated enum ConnectionState: Equatable {
 // 每个服务端一个实例：在线客户端、按客户端分流的输出、目标选择各自独立
 @Observable
 final class LinkSession: NSObject, URLSessionWebSocketDelegate {
-    // 保留目标：指向 server 本机（文件页签浏览服务器文件），server 端拦截不转发
+    // 保留目标：指向 server 本机（执行命令 / 浏览文件），server 端拦截不转发
     static let serverTargetId = "@server"
 
     var server: Server // 编辑服务器时更新，连接时取其 url/token
@@ -397,13 +397,8 @@ final class LinkSession: NSObject, URLSessionWebSocketDelegate {
             return
         }
 
-        // 其余输入作为 shell 命令下发
+        // 其余输入作为 shell 命令下发（客户端与服务器主机目标均在远端执行）
         guard requireTarget() else { return }
-        // 服务器主机仅支持文件浏览（server 端也会拒绝），就地提示更直观
-        if currentTarget == Self.serverTargetId {
-            append("[服务器主机仅支持文件浏览，不支持执行命令]", .system)
-            return
-        }
         send(OutgoingMessage.exec(reqId: newReqId(), targetId: currentTarget!, command: input))
     }
 

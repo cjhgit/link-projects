@@ -36,6 +36,7 @@
 | `PORT` | server | ws:// 明文监听端口（云服务器安全组需放行） | 9600 |
 | `CLIENTS_FILE` | server | client 白名单文件路径 | `<项目根>/clients.json` |
 | `ALLOW_SERVER_FILES` | server | 是否允许 controller 浏览服务器本机文件（`@server` 目标），设 `0` 禁用 | `1`（允许） |
+| `ALLOW_SERVER_EXEC` | server | 是否允许 controller 在服务器本机执行命令（`@server` 目标），设 `0` 禁用 | `1`（允许） |
 | `TLS_PORT` | server | wss:// 加密监听端口，配置 `TLS_CERT`+`TLS_KEY` 后启用，与 ws 并存（安全组需放行） | 9601 |
 | `TLS_CERT` | server | TLS 证书路径（含完整链），与 `TLS_KEY` 同时配置才生效 | 无 |
 | `TLS_KEY` | server | TLS 私钥路径 | 无 |
@@ -131,7 +132,7 @@ run       前台运行，调试排查用（Ctrl+C 退出）
 - 支持同时管理多个服务端：左侧服务器列表（+ 添加，右键/`…` 连接、断开、编辑、删除，状态点绿=已连接、黄=连接中），每个服务端一条独立连接，启动时自动连接所有已配置 token 的服务端
 - **客户端列表 = 白名单全体**：中间列显示当前选中服务端的全部登记客户端（在线只是状态：绿点=在线、灰点=离线，点击即设为目标、等价 `/use`），右侧终端输出/输入随之切换，各服务端的目标选择独立记忆；未连接时保留显示上次同步的白名单
 - **客户端管理就地完成**，无需登录服务器：标题栏 `+` 登记新客户端（token 支持随机生成），右键行可编辑、删除（在线连接立即断开，之后无法再注册）、拷贝 ID / Token / 接入配置（.env 三行）；变更经 server 原子写回 `clients.json` 并广播给所有控制端，多端列表自动同步
-- **可浏览服务器本机文件**：客户端列表固定首行「服务器主机」（`@server` 保留目标，`~` 为 server 家目录），选中后「文件」页签即可浏览/查看/编辑/新建/删除 server 上的文件（如直接改 `clients.json`、看日志）；服务器主机不支持执行命令，浏览能力由 server 的 `ALLOW_SERVER_FILES` 控制
+- **可直接操作服务器本机**：客户端列表固定首行「服务器主机」（`@server` 保留目标，`~` 为 server 家目录），选中后终端即可在 server 上执行命令（实时输出），「文件」页签可浏览/查看/编辑/新建/删除 server 上的文件（如直接改 `clients.json`、看日志）；命令与文件浏览分别由 server 的 `ALLOW_SERVER_EXEC` / `ALLOW_SERVER_FILES` 控制
 - 服务端列表存于 UserDefaults；首次启动自动从旧的单服务端配置（`~/.link-projects/controller.env` / 环境变量 / 旧 UserDefaults）迁移
 - 交互命令与上面一致（另含 `/clear` 清屏，无 `/exit`）
 - 命令行运行：`./run.sh`（杀掉旧进程 → xcodebuild 构建 → 后台启动，日志 `/tmp/controller-mac.log`）

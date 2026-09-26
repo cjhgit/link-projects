@@ -147,7 +147,7 @@ private struct ClientSidebar: View {
                         if let id, id != session.currentTarget {
                             session.currentTarget = id
                             if id == LinkSession.serverTargetId {
-                                session.append("[已选择 服务器主机，「文件」页签可浏览 server 本机文件]", .system)
+                                session.append("[已选择 服务器主机，终端与「文件」页签直接操作 server 本机]", .system)
                             } else {
                                 let online = session.onlineClients.contains { $0.clientId == id }
                                 session.append("[已选择 \(id)\(online ? "" : "（离线）")]", .system)
@@ -263,7 +263,7 @@ private struct ClientSidebar: View {
             }
         }
         .tag(LinkSession.serverTargetId)
-        .help("选中后「文件」页签浏览该服务器本机的文件（不支持执行命令）")
+        .help("选中后终端可对 server 本机执行命令，「文件」页签浏览其文件")
     }
 
     private func clientRow(_ row: ClientRow, session: LinkSession) -> some View {

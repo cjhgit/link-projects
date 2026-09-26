@@ -1,6 +1,7 @@
 import './env';
 import { WebSocketServer, WebSocket } from 'ws';
 import https from 'node:https';
+import { spawn, type ChildProcess } from 'node:child_process';
 import { existsSync, readFileSync, writeFileSync, renameSync } from 'node:fs';
 import { readFile, writeFile, rm, mkdir, readdir, stat } from 'node:fs/promises';
 import { homedir } from 'node:os';
@@ -65,16 +66,49 @@ const clients = new Map<string, WebSocket>();
 // 所有已注册的 controller 连接
 const controllers = new Set<WebSocket>();
 
-// ---------- 服务器本机文件浏览（targetId = @server 保留目标） ----------
+// ---------- 服务器本机操作：执行命令 + 文件浏览（targetId = @server 保留目标） ----------
 
-// 保留 targetId：controller 的文件类消息带此目标时不转发，由 server 就地处理（浏览服务器本机文件）
+// 保留 targetId：controller 的 exec / 文件类消息带此目标时不转发，由 server 就地处理（操作服务器本机）
 const SERVER_TARGET = '@server';
 // 是否允许浏览服务器本机文件（默认允许；设 0 可禁止，防止 controller token 泄露时波及服务器自身文件）
 const ALLOW_SERVER_FILES = process.env.ALLOW_SERVER_FILES !== '0';
+// 是否允许在服务器本机执行命令（默认允许；设 0 可禁止，比文件浏览风险更高，可单独关闭）
+const ALLOW_SERVER_EXEC = process.env.ALLOW_SERVER_EXEC !== '0';
+
+// @server 目标执行中的命令子进程；进程退出时统一清理，避免遗留孤儿进程
+const serverChildren = new Set<ChildProcess>();
+function killServerChildren() {
+  for (const child of serverChildren) {
+    try { child.kill(); } catch { /* 忽略 */ }
+  }
+}
+process.on('SIGTERM', () => { killServerChildren(); process.exit(0); });
+process.on('SIGINT', () => { killServerChildren(); process.exit(0); });
 
 // 服务器本机文件操作响应（结构对齐 client 的同名响应，targetId 固定为 @server）
 function serverReply(ws: WebSocket, msg: any, payload: Record<string, unknown>) {
   send(ws, { reqId: msg.reqId ?? '', targetId: SERVER_TARGET, ...payload } as AnyMsg);
+}
+
+// 在服务器本机执行 shell 命令，stdout/stderr 流式回传（对齐 client 的 handleExec）
+function serverExec(ws: WebSocket, msg: any) {
+  console.log(`[exec] @server ${msg.command}${msg.cwd ? ` (cwd: ${msg.cwd})` : ''}`);
+  const child = spawn('/bin/bash', ['-c', msg.command], { cwd: msg.cwd || undefined });
+  serverChildren.add(child);
+  child.on('exit', () => serverChildren.delete(child));
+
+  const output = (stream: 'stdout' | 'stderr') => (d: Buffer) => {
+    send(ws, { reqId: msg.reqId, targetId: SERVER_TARGET, type: 'exec-output', stream, data: d.toString() } as AnyMsg);
+  };
+  child.stdout.on('data', output('stdout'));
+  child.stderr.on('data', output('stderr'));
+  child.on('error', (err) => {
+    send(ws, { reqId: msg.reqId, targetId: SERVER_TARGET, type: 'exec-output', stream: 'stderr', data: `启动失败: ${err.message}\n` } as AnyMsg);
+    send(ws, { reqId: msg.reqId, targetId: SERVER_TARGET, type: 'exec-exit', code: 127 } as AnyMsg);
+  });
+  child.on('exit', (code) => {
+    send(ws, { reqId: msg.reqId, targetId: SERVER_TARGET, type: 'exec-exit', code } as AnyMsg);
+  });
 }
 
 // 以下五个处理函数与 client/src/index.ts 的同名逻辑保持一致（~ 展开、stat 容错、wx 防覆盖等），
@@ -304,8 +338,14 @@ function onConnection(ws: WebSocket) {
     // controller -> client：按 targetId 转发
     if (role === 'controller' && msg.type !== 'register') {
       const m = msg as any;
-      // 保留目标 @server：文件类消息由 server 就地处理（浏览服务器本机），其余类型拒绝
+      // 保留目标 @server：exec 与文件类消息由 server 就地处理（操作服务器本机）
       if (m.targetId === SERVER_TARGET) {
+        if (msg.type === 'exec') {
+          if (!ALLOW_SERVER_EXEC) {
+            return send(ws, { type: 'error', reqId: m.reqId, message: '服务端已禁用本机命令执行（ALLOW_SERVER_EXEC=0）' });
+          }
+          return serverExec(ws, m);
+        }
         if (!ALLOW_SERVER_FILES) {
           return send(ws, { type: 'error', reqId: m.reqId, message: '服务端已禁用本机文件浏览（ALLOW_SERVER_FILES=0）' });
         }
@@ -316,7 +356,7 @@ function onConnection(ws: WebSocket) {
           case 'file-create': return serverFileCreate(ws, m);
           case 'file-delete': return serverFileDelete(ws, m);
           default:
-            return send(ws, { type: 'error', reqId: m.reqId, message: '服务器主机仅支持文件浏览，不支持执行命令' });
+            return send(ws, { type: 'error', reqId: m.reqId, message: `服务器主机不支持 ${msg.type} 类型消息` });
         }
       }
       const target = m.targetId ? clients.get(m.targetId) : undefined;
