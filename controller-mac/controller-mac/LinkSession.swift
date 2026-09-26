@@ -14,6 +14,8 @@ final class LinkSession: NSObject, URLSessionWebSocketDelegate {
     var server: Server // 编辑服务器时更新，连接时取其 url/token
 
     private(set) var state: ConnectionState = .disconnected
+    // server 通过 registered 下发的自身版本（package.json），旧版 server 不下发；断开后保留展示
+    private(set) var serverVersion: String?
     // 输出按客户端分流（key = clientId，"" 为公共区：连接状态等与具体客户端无关的消息）
     // 当前查看区由 currentTarget 决定，切换客户端时右侧只显示各自的内容
     private(set) var outputs: [String: [OutputLine]] = [:]
@@ -184,7 +186,7 @@ final class LinkSession: NSObject, URLSessionWebSocketDelegate {
         guard let msg = IncomingMessage.parse(text) else { return }
 
         switch msg {
-        case .registered(let ok, let error):
+        case .registered(let ok, let error, let serverVersion):
             if !ok {
                 append("[注册被拒绝] \(error ?? "未知错误")", .system, to: "")
                 disconnect()
@@ -192,7 +194,9 @@ final class LinkSession: NSObject, URLSessionWebSocketDelegate {
                 return
             }
             state = .connected
-            append("[已连接服务器 \(server.displayName)]", .system, to: "")
+            self.serverVersion = serverVersion
+            let versionSuffix = serverVersion.map { "（v\($0)）" } ?? ""
+            append("[已连接服务器 \(server.displayName)\(versionSuffix)]", .system, to: "")
             send(OutgoingMessage.listClients())
 
         case .clients(let clients):
@@ -215,7 +219,8 @@ final class LinkSession: NSObject, URLSessionWebSocketDelegate {
                 } else {
                     let detail = clients.map { c in
                         let cur = c.clientId == currentTarget
-                        return "  \(cur ? "*" : " ") \(c.clientId)\(cur ? "  <- 当前" : "")"
+                        let version = c.version.map { " (v\($0))" } ?? ""
+                        return "  \(cur ? "*" : " ") \(c.clientId)\(version)\(cur ? "  <- 当前" : "")"
                     }.joined(separator: "\n")
                     append("在线客户端：\n\(detail)", .system)
                 }
@@ -500,12 +505,21 @@ final class LinkSession: NSObject, URLSessionWebSocketDelegate {
     // 避免升级过渡期中间列空白
     var clientRows: [ClientRow] {
         let onlineIds = Set(onlineClients.map(\.clientId))
+        // 在线客户端的版本表（有版本必然在线，在线未必有版本：旧版 client 不上报）
+        let onlineVersions = [String: String](onlineClients.compactMap { c in
+            c.version.map { (c.clientId, $0) }
+        }, uniquingKeysWith: { first, _ in first })
         var rows = whitelist.map { client in
-            ClientRow(clientId: client.clientId, token: client.token, online: onlineIds.contains(client.clientId))
+            ClientRow(
+                clientId: client.clientId,
+                token: client.token,
+                online: onlineIds.contains(client.clientId),
+                version: onlineVersions[client.clientId]
+            )
         }
         let knownIds = Set(whitelist.map(\.clientId))
         for id in onlineIds where !knownIds.contains(id) {
-            rows.append(ClientRow(clientId: id, token: nil, online: true))
+            rows.append(ClientRow(clientId: id, token: nil, online: true, version: onlineVersions[id]))
         }
         return rows.sorted {
             if $0.online != $1.online { return $0.online }

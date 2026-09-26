@@ -7,6 +7,7 @@ import Foundation
 nonisolated struct ClientInfo: Identifiable, Equatable {
     let clientId: String
     let connectedAt: Double
+    let version: String? // client 注册时上报的自身版本，旧版 client 不带
     var id: String { clientId }
 }
 
@@ -19,11 +20,13 @@ nonisolated struct WhitelistClient: Identifiable, Equatable {
 }
 
 // 中间列的统一客户端行：白名单条目 + 实时在线状态（在线不再是筛选条件，只是状态）。
-// token 为 nil 表示该行仅来自在线列表（旧版 server 不下发白名单时的回退，不可编辑）
+// token 为 nil 表示该行仅来自在线列表（旧版 server 不下发白名单时的回退，不可编辑）；
+// version 仅在线时已知（来自该 client 注册时的上报）
 nonisolated struct ClientRow: Identifiable, Equatable {
     let clientId: String
     let token: String?
     var online: Bool
+    var version: String?
     var id: String { clientId }
 }
 
@@ -74,7 +77,7 @@ nonisolated struct OutputLine: Identifiable {
 // 收到的消息（已按 type 分发）；client 响应均带 targetId（= 来源 client 的 id），用于按客户端分流输出
 // done/error 带 reqId：白名单管理类请求据此路由到对应回调，而非显示到终端
 nonisolated enum IncomingMessage {
-    case registered(ok: Bool, error: String?)
+    case registered(ok: Bool, error: String?, serverVersion: String?)
     case clients([ClientInfo])
     case whitelist([WhitelistClient], reqId: String?)
     case execOutput(reqId: String, stream: String, data: String, targetId: String)
@@ -94,13 +97,15 @@ nonisolated enum IncomingMessage {
         case "registered":
             return .registered(
                 ok: obj["ok"] as? Bool ?? false,
-                error: obj["error"] as? String
+                error: obj["error"] as? String,
+                serverVersion: obj["serverVersion"] as? String
             )
         case "clients":
             let list = (obj["clients"] as? [[String: Any]] ?? []).map {
                 ClientInfo(
                     clientId: $0["clientId"] as? String ?? "",
-                    connectedAt: $0["connectedAt"] as? Double ?? 0
+                    connectedAt: $0["connectedAt"] as? Double ?? 0,
+                    version: $0["version"] as? String
                 )
             }
             return .clients(list)

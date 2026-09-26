@@ -93,6 +93,12 @@ private struct ServerSidebar: View {
                 .frame(width: 6, height: 6)
             Text(server.displayName)
                 .lineLimit(1)
+            if let version = model.sessions[server.id]?.serverVersion {
+                Text("v\(version)")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .help("服务端版本")
+            }
             Spacer()
             if let session = model.sessions[server.id], session.state == .connected {
                 Text("\(session.onlineClients.count)")
@@ -234,6 +240,12 @@ private struct ClientSidebar: View {
                 .help(row.online ? "在线" : "离线")
             Text(row.clientId)
                 .lineLimit(1)
+            if let version = row.version {
+                Text("v\(version)")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .help("客户端版本")
+            }
             if row.clientId == session.currentTarget {
                 Spacer()
                 Image(systemName: "chevron.right")
@@ -329,6 +341,11 @@ private struct ConnectView: View {
                 .font(.callout)
                 .foregroundStyle(.secondary)
                 .textSelection(.enabled)
+            if let version = session.serverVersion {
+                Text("服务端版本 v\(version)")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
             switch session.state {
             case .connecting:
                 HStack(spacing: 8) {

@@ -47,6 +47,9 @@ const SERVER = argOf('server') || process.env.LINK_SERVER || 'ws://127.0.0.1:960
 const CLIENT_ID = argOf('id') || process.env.LINK_CLIENT_ID || osHostname();
 const TOKEN = argOf('token') || process.env.LINK_TOKEN || '';
 
+// 自身版本（package.json 的 version，dev 与 dist 两种运行方式下 package.json 都在上级目录）
+const VERSION: string = JSON.parse(readFileSync(join(__dirname, '..', 'package.json'), 'utf8')).version;
+
 // ---------- 运行时文件：pid 与日志都在 ~/.link-projects/ ----------
 
 const RUNTIME_DIR = join(homedir(), '.link-projects');
@@ -261,6 +264,7 @@ function connect() {
       role: 'client',
       clientId: CLIENT_ID,
       token: TOKEN,
+      version: VERSION,
     }));
     console.log(`[client] 已连接 ${SERVER}，以 ${CLIENT_ID} 注册`);
   });

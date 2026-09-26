@@ -12,6 +12,8 @@ const PORT = Number(process.env.PORT || 9600);
 const CONTROLLER_TOKEN = process.env.CONTROLLER_TOKEN || '';
 // client 白名单文件（clientId -> 专属 token），默认放在项目根目录
 const CLIENTS_FILE = process.env.CLIENTS_FILE || join(__dirname, '..', 'clients.json');
+// 自身版本（package.json 的 version，dev 与 dist 两种运行方式下 package.json 都在上级目录）
+const VERSION: string = JSON.parse(readFileSync(join(__dirname, '..', 'package.json'), 'utf8')).version;
 
 if (!CONTROLLER_TOKEN) {
   console.error('缺少 CONTROLLER_TOKEN 环境变量，退出');
@@ -68,6 +70,7 @@ function broadcastClientList() {
     clients: [...clients.entries()].map(([clientId, ws]) => ({
       clientId,
       connectedAt: (ws as any).__connectedAt ?? 0,
+      version: (ws as any).__version || undefined,
     })),
   };
   for (const c of controllers) send(c, list);
@@ -137,13 +140,14 @@ wss.on('connection', (ws) => {
         if (old && old !== ws) old.close();
         clients.set(clientId, ws);
         (ws as any).__connectedAt = Date.now();
-        console.log(`[client] ${clientId} 上线（共 ${clients.size} 台）`);
+        (ws as any).__version = reg.version || '';
+        console.log(`[client] ${clientId} 上线（共 ${clients.size} 台）${reg.version ? `，版本 ${reg.version}` : ''}`);
         broadcastClientList();
       } else {
         controllers.add(ws);
         console.log('[controller] 上线');
       }
-      send(ws, { type: 'registered', ok: true });
+      send(ws, { type: 'registered', ok: true, serverVersion: VERSION });
       // controller 注册后顺带推送白名单，管理界面打开即有数据
       if (role === 'controller') sendWhitelist(ws);
       return;
@@ -156,6 +160,7 @@ wss.on('connection', (ws) => {
         clients: [...clients.entries()].map(([id, c]) => ({
           clientId: id,
           connectedAt: (c as any).__connectedAt ?? 0,
+          version: (c as any).__version || undefined,
         })),
       });
     }

@@ -8,12 +8,14 @@ export interface RegisterMsg {
   role: 'client' | 'controller';
   clientId: string; // client 的唯一标识；controller 传随机 id
   token: string;
+  version?: string; // client 上报的自身版本（package.json），服务端原样透出
 }
 
 export interface RegisteredMsg {
   type: 'registered';
   ok: boolean;
   error?: string;
+  serverVersion?: string; // server 自身版本（package.json），旧版 server 不下发
 }
 
 // controller -> server 查询在线客户端
@@ -24,7 +26,7 @@ export interface ListClientsMsg {
 // server -> controller 在线列表
 export interface ClientsMsg {
   type: 'clients';
-  clients: { clientId: string; connectedAt: number }[];
+  clients: { clientId: string; connectedAt: number; version?: string }[]; // version 为该 client 注册时上报的版本
 }
 
 // ===== 执行命令（流式回传） =====
