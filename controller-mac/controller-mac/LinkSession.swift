@@ -19,6 +19,8 @@ final class LinkSession: NSObject, URLSessionWebSocketDelegate {
     private(set) var outputs: [String: [OutputLine]] = [:]
     var lines: [OutputLine] { outputs[currentTarget ?? ""] ?? [] }
     private(set) var onlineClients: [ClientInfo] = []
+    // 服务端白名单全量列表（连接后推送 / 变更后广播刷新，断开不清空以便管理界面继续查看）
+    private(set) var whitelist: [WhitelistClient] = []
     var currentTarget: String? {
         didSet {
             guard !initializing else { return }
@@ -31,6 +33,8 @@ final class LinkSession: NSObject, URLSessionWebSocketDelegate {
     private var autoConnected = false // 启动时若已配置 token 只自动连接一次，避免失败后循环重连
     private var initializing = true // init 期间的赋值不触发持久化
     private var outputReqIds: Set<String> = [] // 收到过输出的请求，exec 结束时据此判断是否 [无输出]
+    // 白名单管理请求的回调（reqId -> 回执），done/error 按此路由到管理界面而非终端
+    private var manageCallbacks: [String: (String?) -> Void] = [:]
 
     private static let maxLines = 5000
     private static let targetsKey = "LINK_TARGETS" // 每个服务端各自记住的目标客户端 [serverId: clientId]
@@ -119,6 +123,10 @@ final class LinkSession: NSObject, URLSessionWebSocketDelegate {
         ws = nil
         state = .disconnected
         onlineClients = []
+        // 管理类请求不会再有回执，统一以失败回调，避免管理界面一直等待
+        let pending = manageCallbacks
+        manageCallbacks.removeAll()
+        for callback in pending.values { callback("连接已断开") }
     }
 
     // MARK: - WebSocket 收发
@@ -185,8 +193,10 @@ final class LinkSession: NSObject, URLSessionWebSocketDelegate {
             let before = onlineClients.map(\.clientId)
             let after = clients.map(\.clientId)
             onlineClients = clients
-            // 当前目标掉线、或还没选且只有一台在线时，自动选择
-            if let target = currentTarget, !after.contains(target) {
+            // 统一列表后目标可指向离线客户端（行仍可见），仅当其被移出白名单时才重置；
+            // 还没选且只有一台在线时自动选择
+            let whitelistIds = Set(whitelist.map(\.clientId))
+            if let target = currentTarget, !after.contains(target), !whitelistIds.contains(target) {
                 currentTarget = after.count == 1 ? after[0] : nil
             } else if currentTarget == nil, after.count == 1 {
                 currentTarget = after[0]
@@ -206,6 +216,13 @@ final class LinkSession: NSObject, URLSessionWebSocketDelegate {
                 appendSeparator()
             } else if !before.isEmpty || state == .connected, before != after {
                 append("[在线客户端: \(after.joined(separator: ", "))]", .system)
+            }
+
+        case .whitelist(let clients, let reqId):
+            whitelist = clients
+            // list-whitelist 的主动请求：通知发起方已拿到列表
+            if let reqId, let callback = manageCallbacks.removeValue(forKey: reqId) {
+                callback(nil)
             }
 
         case .execOutput(let reqId, let stream, let data, let targetId):
@@ -232,11 +249,20 @@ final class LinkSession: NSObject, URLSessionWebSocketDelegate {
             }
             appendSeparator(to: targetId)
 
-        case .done(let ok, let error, let targetId):
+        case .done(let reqId, let ok, let error, let targetId):
+            // 白名单管理类回执：路由到管理界面，不进终端
+            if let callback = manageCallbacks.removeValue(forKey: reqId) {
+                callback(ok ? nil : (error ?? "操作失败"))
+                return
+            }
             append(ok ? "[写入成功]" : "[写入失败] \(error ?? "")", .system, to: targetId)
             appendSeparator(to: targetId)
 
-        case .error(let message):
+        case .error(let reqId, let message):
+            if let reqId, let callback = manageCallbacks.removeValue(forKey: reqId) {
+                callback(message)
+                return
+            }
             append("[错误] \(message)", .system)
             appendSeparator()
         }
@@ -335,7 +361,62 @@ final class LinkSession: NSObject, URLSessionWebSocketDelegate {
         return false
     }
 
+    // MARK: - 客户端白名单管理（发给 server 直接处理，回执经 manageCallbacks 路由）
+
+    /// 拉取白名单；completion 参数为 nil 表示成功（列表已更新到 whitelist）
+    func refreshWhitelist(_ completion: ((String?) -> Void)? = nil) {
+        guard state == .connected else {
+            completion?("未连接服务器")
+            return
+        }
+        let reqId = newReqId()
+        if let completion { manageCallbacks[reqId] = completion }
+        send(OutgoingMessage.listWhitelist(reqId: reqId))
+    }
+
+    /// 新增客户端；completion 参数为 nil 表示成功，否则为错误信息
+    func addClient(clientId: String, token: String, completion: @escaping (String?) -> Void) {
+        guard state == .connected else { return completion("未连接服务器") }
+        let reqId = newReqId()
+        manageCallbacks[reqId] = completion
+        send(OutgoingMessage.clientAdd(reqId: reqId, clientId: clientId, token: token))
+    }
+
+    /// 更新客户端 token（不影响已建立的连接，重连后生效）
+    func updateClient(clientId: String, token: String, completion: @escaping (String?) -> Void) {
+        guard state == .connected else { return completion("未连接服务器") }
+        let reqId = newReqId()
+        manageCallbacks[reqId] = completion
+        send(OutgoingMessage.clientUpdate(reqId: reqId, clientId: clientId, token: token))
+    }
+
+    /// 删除客户端（服务端会同步断开其在线连接）
+    func removeClient(clientId: String, completion: @escaping (String?) -> Void) {
+        guard state == .connected else { return completion("未连接服务器") }
+        let reqId = newReqId()
+        manageCallbacks[reqId] = completion
+        send(OutgoingMessage.clientRemove(reqId: reqId, clientId: clientId))
+    }
+
     // MARK: - 工具
+
+    // 统一客户端列表 = 白名单全体 + 实时在线状态（在线在前，其余按名称排序）。
+    // 旧版 server 不下发白名单时，把在线客户端并入（token 为 nil：可查看选择，不可编辑删除），
+    // 避免升级过渡期中间列空白
+    var clientRows: [ClientRow] {
+        let onlineIds = Set(onlineClients.map(\.clientId))
+        var rows = whitelist.map { client in
+            ClientRow(clientId: client.clientId, token: client.token, online: onlineIds.contains(client.clientId))
+        }
+        let knownIds = Set(whitelist.map(\.clientId))
+        for id in onlineIds where !knownIds.contains(id) {
+            rows.append(ClientRow(clientId: id, token: nil, online: true))
+        }
+        return rows.sorted {
+            if $0.online != $1.online { return $0.online }
+            return $0.clientId.localizedStandardCompare($1.clientId) == .orderedAscending
+        }
+    }
 
     private func newReqId() -> String {
         String(UUID().uuidString.prefix(8))

@@ -30,6 +30,13 @@ enum ServerSheet: Identifiable {
     }
 }
 
+// 添加 / 编辑客户端弹窗状态（client 为 nil = 新增），携带目标服务端的会话
+struct ClientEditSheet: Identifiable {
+    let session: LinkSession
+    let client: WhitelistClient? // nil = 新增
+    let id = UUID()
+}
+
 // 全局共享配置 ~/.link-projects/controller.env（与 node 版 controller 共用）
 // 多服务端列表存于 UserDefaults，本文件现仅用于首次启动时迁移旧的单服务端配置
 nonisolated enum SharedConfig {
@@ -59,6 +66,7 @@ final class AppModel {
     private(set) var servers: [Server] = []
     private(set) var sessions: [UUID: LinkSession] = [:]
     var serverSheet: ServerSheet?
+    var clientEditSheet: ClientEditSheet?
     var selectedServerId: UUID? {
         didSet {
             guard !initializing else { return }

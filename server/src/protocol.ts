@@ -1,6 +1,7 @@
 // 三个端共享的消息协议定义（client / controller 目录各有一份相同拷贝）
 // 路由规则：controller 发出的消息带 targetId（目标 client），由 server 转发；
-// client 发出的响应消息原样广播给所有 controller，各自按 reqId 过滤。
+// client 发出的响应消息原样广播给所有 controller，各自按 reqId 过滤；
+// 白名单管理类消息（*-whitelist / client-*）由 server 直接处理，不转发给 client。
 
 export interface RegisterMsg {
   type: 'register';
@@ -78,7 +79,7 @@ export interface FileWriteMsg {
 export interface DoneMsg {
   type: 'done';
   reqId: string;
-  targetId: string;
+  targetId: string; // 白名单管理类操作由 server 响应时为空字符串（不经 client 转发）
   ok: boolean;
   error?: string;
 }
@@ -89,6 +90,44 @@ export interface ErrorMsg {
   message: string;
 }
 
+// ===== 客户端白名单管理（controller -> server 直接处理，响应也由 server 回给 controller） =====
+
+// 查询服务端 clients.json 全量白名单
+export interface ListWhitelistMsg {
+  type: 'list-whitelist';
+  reqId?: string;
+}
+
+// server -> controller 白名单全量列表（controller 注册后 / 白名单变更后推送，或作为 list-whitelist 响应）
+export interface WhitelistMsg {
+  type: 'whitelist';
+  reqId?: string; // 仅作为 list-whitelist 响应时回传
+  clients: { clientId: string; token: string; online: boolean }[];
+}
+
+// 新增客户端（clientId 已存在则失败）
+export interface ClientAddMsg {
+  type: 'client-add';
+  reqId: string;
+  clientId: string;
+  token: string;
+}
+
+// 更新客户端 token（clientId 不存在则失败；不影响已建立的连接，重连后生效）
+export interface ClientUpdateMsg {
+  type: 'client-update';
+  reqId: string;
+  clientId: string;
+  token: string;
+}
+
+// 删除客户端（同时断开其在线连接，立即生效）
+export interface ClientRemoveMsg {
+  type: 'client-remove';
+  reqId: string;
+  clientId: string;
+}
+
 export type ClientToServerMsg = RegisterMsg | ExecOutputMsg | ExecExitMsg | FileContentMsg | DoneMsg;
 export type ServerMsg =
   | RegisteredMsg
@@ -96,5 +135,14 @@ export type ServerMsg =
   | ExecMsg
   | FileReadMsg
   | FileWriteMsg
+  | DoneMsg
+  | WhitelistMsg
   | ErrorMsg;
-export type AnyMsg = ClientToServerMsg | ServerMsg | ListClientsMsg;
+export type AnyMsg =
+  | ClientToServerMsg
+  | ServerMsg
+  | ListClientsMsg
+  | ListWhitelistMsg
+  | ClientAddMsg
+  | ClientUpdateMsg
+  | ClientRemoveMsg;

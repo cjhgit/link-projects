@@ -1,6 +1,6 @@
 import './env';
 import { WebSocketServer, WebSocket } from 'ws';
-import { existsSync, readFileSync } from 'node:fs';
+import { existsSync, readFileSync, writeFileSync, renameSync } from 'node:fs';
 import { join } from 'node:path';
 import type {
   AnyMsg,
@@ -22,13 +22,31 @@ if (!existsSync(CLIENTS_FILE)) {
   process.exit(1);
 }
 
-// 每次注册时重读白名单，增删 client 无需重启服务
-function loadClientTokens(): Record<string, string> {
+// 白名单读取：文件缺失/格式错误时返回 null（区别于空名单），管理类写入据此拒绝，避免把损坏文件覆盖成空名单
+function readWhitelist(): Record<string, string> | null {
   try {
     return JSON.parse(readFileSync(CLIENTS_FILE, 'utf8'));
   } catch (err) {
     console.error(`[auth] 白名单文件解析失败: ${(err as Error).message}`);
-    return {};
+    return null;
+  }
+}
+
+// 每次注册时重读白名单，增删 client 无需重启服务
+function loadClientTokens(): Record<string, string> {
+  return readWhitelist() ?? {};
+}
+
+// 白名单写回：临时文件 + rename 原子替换，保持 2 空格缩进便于人工查看
+function saveWhitelist(map: Record<string, string>): boolean {
+  try {
+    const tmp = `${CLIENTS_FILE}.tmp`;
+    writeFileSync(tmp, `${JSON.stringify(map, null, 2)}\n`, 'utf8');
+    renameSync(tmp, CLIENTS_FILE);
+    return true;
+  } catch (err) {
+    console.error(`[whitelist] 白名单文件写入失败: ${(err as Error).message}`);
+    return false;
   }
 }
 
@@ -52,6 +70,29 @@ function broadcastClientList() {
       connectedAt: (ws as any).__connectedAt ?? 0,
     })),
   };
+  for (const c of controllers) send(c, list);
+}
+
+// 白名单全量列表（online 按当前在线连接实时计算）
+function whitelistMsg() {
+  const map = loadClientTokens();
+  return {
+    type: 'whitelist' as const,
+    clients: Object.entries(map).map(([clientId, token]) => ({
+      clientId,
+      token,
+      online: clients.has(clientId),
+    })),
+  };
+}
+
+function sendWhitelist(ws: WebSocket, reqId?: string) {
+  send(ws, { ...whitelistMsg(), reqId });
+}
+
+// 白名单变更后推给所有 controller，各端列表保持同步
+function broadcastWhitelist() {
+  const list = whitelistMsg();
   for (const c of controllers) send(c, list);
 }
 
@@ -102,7 +143,10 @@ wss.on('connection', (ws) => {
         controllers.add(ws);
         console.log('[controller] 上线');
       }
-      return send(ws, { type: 'registered', ok: true });
+      send(ws, { type: 'registered', ok: true });
+      // controller 注册后顺带推送白名单，管理界面打开即有数据
+      if (role === 'controller') sendWhitelist(ws);
+      return;
     }
 
     // controller 查询在线列表
@@ -114,6 +158,45 @@ wss.on('connection', (ws) => {
           connectedAt: (c as any).__connectedAt ?? 0,
         })),
       });
+    }
+
+    // controller 查询白名单
+    if (role === 'controller' && msg.type === 'list-whitelist') {
+      return sendWhitelist(ws, (msg as any).reqId);
+    }
+
+    // controller 增删改白名单（server 直接处理并回执，不经 client 转发）
+    if (role === 'controller' && ['client-add', 'client-update', 'client-remove'].includes(msg.type)) {
+      const m = msg as any;
+      const reply = (ok: boolean, error?: string) =>
+        send(ws, { type: 'done', reqId: m.reqId ?? '', targetId: '', ok, error });
+      const clientId = String(m.clientId ?? '').trim();
+      const token = String(m.token ?? '').trim();
+      if (!clientId) return reply(false, 'clientId 不能为空');
+
+      const map = readWhitelist();
+      if (!map) return reply(false, '白名单文件读取失败，请先在服务器上检查 clients.json 格式');
+      if (msg.type === 'client-add') {
+        if (!token) return reply(false, 'token 不能为空');
+        if (map[clientId] !== undefined) return reply(false, `客户端 ${clientId} 已存在`);
+        map[clientId] = token;
+      } else if (msg.type === 'client-update') {
+        if (map[clientId] === undefined) return reply(false, `客户端 ${clientId} 不存在`);
+        if (!token) return reply(false, 'token 不能为空');
+        map[clientId] = token;
+      } else {
+        if (map[clientId] === undefined) return reply(false, `客户端 ${clientId} 不存在`);
+        delete map[clientId];
+      }
+      if (!saveWhitelist(map)) return reply(false, '白名单文件写入失败（检查服务器磁盘/权限）');
+
+      console.log(`[whitelist] ${msg.type === 'client-add' ? '新增' : msg.type === 'client-update' ? '更新' : '删除'} ${clientId}`);
+      reply(true);
+      broadcastWhitelist();
+      // 删除时同步断开在线连接，立即生效（client 重连注册会因白名单缺失被拒）；
+      // 更新 token 不断开，旧连接保持，重连后用新 token
+      if (msg.type === 'client-remove') clients.get(clientId)?.close(4001, 'removed from whitelist');
+      return;
     }
 
     // controller -> client：按 targetId 转发
@@ -130,8 +213,11 @@ wss.on('connection', (ws) => {
       return send(target, msg);
     }
 
-    // client -> controller：响应广播给所有 controller，各自按 reqId 过滤
+    // client -> controller：响应广播给所有 controller，各自按 reqId 过滤。
+    // 只放行指令响应类消息，防止 client 伪造 clients / whitelist 等服务端消息
+    const CLIENT_RESPONSE_TYPES = new Set(['exec-output', 'exec-exit', 'file-content', 'done']);
     if (role === 'client' && msg.type !== 'register') {
+      if (!CLIENT_RESPONSE_TYPES.has(msg.type)) return;
       for (const c of controllers) send(c, msg);
     }
   });

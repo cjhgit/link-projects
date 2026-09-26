@@ -10,6 +10,23 @@ nonisolated struct ClientInfo: Identifiable, Equatable {
     var id: String { clientId }
 }
 
+// 白名单客户端（服务端 clients.json 的一条记录），online 为下发时刻是否在线
+nonisolated struct WhitelistClient: Identifiable, Equatable {
+    let clientId: String
+    let token: String
+    let online: Bool
+    var id: String { clientId }
+}
+
+// 中间列的统一客户端行：白名单条目 + 实时在线状态（在线不再是筛选条件，只是状态）。
+// token 为 nil 表示该行仅来自在线列表（旧版 server 不下发白名单时的回退，不可编辑）
+nonisolated struct ClientRow: Identifiable, Equatable {
+    let clientId: String
+    let token: String?
+    var online: Bool
+    var id: String { clientId }
+}
+
 // 输出条目类型：stdout/stderr 为命令输出，system 为本地系统消息，command 为输入回显，separator 为每次交互结束的分隔线
 nonisolated enum OutputKind: Equatable {
     case stdout
@@ -26,14 +43,16 @@ nonisolated struct OutputLine: Identifiable {
 }
 
 // 收到的消息（已按 type 分发）；client 响应均带 targetId（= 来源 client 的 id），用于按客户端分流输出
+// done/error 带 reqId：白名单管理类请求据此路由到对应回调，而非显示到终端
 nonisolated enum IncomingMessage {
     case registered(ok: Bool, error: String?)
     case clients([ClientInfo])
+    case whitelist([WhitelistClient], reqId: String?)
     case execOutput(reqId: String, stream: String, data: String, targetId: String)
     case execExit(reqId: String, code: Int?, targetId: String)
     case fileContent(content: String?, error: String?, targetId: String)
-    case done(ok: Bool, error: String?, targetId: String)
-    case error(message: String)
+    case done(reqId: String, ok: Bool, error: String?, targetId: String)
+    case error(reqId: String?, message: String)
 
     static func parse(_ text: String) -> IncomingMessage? {
         guard let data = text.data(using: .utf8),
@@ -55,6 +74,15 @@ nonisolated enum IncomingMessage {
                 )
             }
             return .clients(list)
+        case "whitelist":
+            let list = (obj["clients"] as? [[String: Any]] ?? []).map {
+                WhitelistClient(
+                    clientId: $0["clientId"] as? String ?? "",
+                    token: $0["token"] as? String ?? "",
+                    online: $0["online"] as? Bool ?? false
+                )
+            }
+            return .whitelist(list, reqId: obj["reqId"] as? String)
         case "exec-output":
             return .execOutput(
                 reqId: obj["reqId"] as? String ?? "",
@@ -78,12 +106,16 @@ nonisolated enum IncomingMessage {
             )
         case "done":
             return .done(
+                reqId: obj["reqId"] as? String ?? "",
                 ok: obj["ok"] as? Bool ?? false,
                 error: obj["error"] as? String,
                 targetId: obj["targetId"] as? String ?? ""
             )
         case "error":
-            return .error(message: obj["message"] as? String ?? "未知错误")
+            return .error(
+                reqId: obj["reqId"] as? String,
+                message: obj["message"] as? String ?? "未知错误"
+            )
         default:
             return nil
         }
@@ -110,6 +142,23 @@ nonisolated enum OutgoingMessage {
 
     static func fileWrite(reqId: String, targetId: String, path: String, content: String) -> String {
         json(["type": "file-write", "reqId": reqId, "targetId": targetId, "path": path, "content": content])
+    }
+
+    // 白名单管理（server 直接处理，不带 targetId）
+    static func listWhitelist(reqId: String) -> String {
+        json(["type": "list-whitelist", "reqId": reqId])
+    }
+
+    static func clientAdd(reqId: String, clientId: String, token: String) -> String {
+        json(["type": "client-add", "reqId": reqId, "clientId": clientId, "token": token])
+    }
+
+    static func clientUpdate(reqId: String, clientId: String, token: String) -> String {
+        json(["type": "client-update", "reqId": reqId, "clientId": clientId, "token": token])
+    }
+
+    static func clientRemove(reqId: String, clientId: String) -> String {
+        json(["type": "client-remove", "reqId": reqId, "clientId": clientId])
     }
 
     private static func json(_ dict: [String: Any]) -> String {

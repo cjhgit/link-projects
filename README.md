@@ -11,7 +11,7 @@
 └────────────┘      └──────────────────┘      └────────────┘
 ```
 
-- **server/**：部署在公网服务器，WebSocket 中继。维护 client 在线列表，把 controller 的指令路由给目标 client，把 client 的响应广播回 controller。不落任何数据。
+- **server/**：部署在公网服务器，WebSocket 中继。维护 client 在线列表，把 controller 的指令路由给目标 client，把 client 的响应广播回 controller；另支持 controller 直接管理 client 白名单（`clients.json`，原子写回）。
 - **client/**：部署在每台云电脑。主动连接 server（出站连接，无需公网 IP），接收指令：执行 shell 命令（stdout/stderr 流式回传）、读写文件。断线自动重连。
 - **controller/**：本地运行的交互式终端，下发指令、实时查看输出。
 
@@ -21,8 +21,8 @@
 
 - **controller** → 使用服务端 `.env` 里的 `CONTROLLER_TOKEN`
 - **client** → 每台机器一个专属 token，登记在服务端 `clients.json`（`{ "clientId": "token" }`），注册时 ID+token 必须匹配
-- `clients.json` 每次注册时实时重读，**新增/删除云电脑只需改文件，无需重启服务**
-- 泄露影响面：controller token 泄露 = 可下发命令；单台 client token 泄露 = 只影响那一台（无法控制其他机器）
+- `clients.json` 每次注册时实时重读，**新增/删除云电脑只需改文件，无需重启服务**；也可用 mac 控制端的「客户端管理」直接增删改（见下），无需登录服务器
+- 泄露影响面：controller token 泄露 = 可下发命令 + 可改白名单；单台 client token 泄露 = 只影响那一台（无法控制其他机器）
 
 ## 配置
 
@@ -110,7 +110,8 @@ run       前台运行，调试排查用（Ctrl+C 退出）
 `controller-mac/` 是功能等价的 macOS 原生控制台（SwiftUI，Xcode 打开 `controller-mac.xcodeproj` 运行）：
 
 - 支持同时管理多个服务端：左侧服务器列表（+ 添加，右键/`…` 连接、断开、编辑、删除，状态点绿=已连接、黄=连接中），每个服务端一条独立连接，启动时自动连接所有已配置 token 的服务端
-- 客户端归属各自的服务端：中间列只显示当前选中服务端的在线客户端（点击即切换目标，等价 `/use`），右侧终端输出/输入也随之切换，各服务端的目标选择独立记忆
+- **客户端列表 = 白名单全体**：中间列显示当前选中服务端的全部登记客户端（在线只是状态：绿点=在线、灰点=离线，点击即设为目标、等价 `/use`），右侧终端输出/输入随之切换，各服务端的目标选择独立记忆；未连接时保留显示上次同步的白名单
+- **客户端管理就地完成**，无需登录服务器：标题栏 `+` 登记新客户端（token 支持随机生成），右键行可编辑、删除（在线连接立即断开，之后无法再注册）、拷贝 ID / Token / 接入配置（.env 三行）；变更经 server 原子写回 `clients.json` 并广播给所有控制端，多端列表自动同步
 - 服务端列表存于 UserDefaults；首次启动自动从旧的单服务端配置（`~/.link-projects/controller.env` / 环境变量 / 旧 UserDefaults）迁移
 - 交互命令与上面一致（另含 `/clear` 清屏，无 `/exit`）
 - 命令行运行：`./run.sh`（杀掉旧进程 → xcodebuild 构建 → 后台启动，日志 `/tmp/controller-mac.log`）
@@ -118,7 +119,7 @@ run       前台运行，调试排查用（Ctrl+C 退出）
 
 ## 运维备忘
 
-- **更新 server 代码**：本地 `server/` 下 `npm run build`，rsync 同步 `dist/` + `package.json` 后重启进程。
+- **更新 server 代码**：本地 `server/` 下 `npm run build`，rsync 同步 `dist/` + `package.json` 后重启进程。客户端管理（白名单增删改）需要 server 为新版，旧版 server 会把管理消息当普通转发而报「客户端不在线」。
 - **更新 client 代码**：云电脑上 `npm run build && npm restart`。
-- **安全**：分角色 token + 每台 client 独立 token（白名单实时重读）；当前传输为明文 ws，如需公网加密可前置 nginx TLS 或改 wss。
+- **安全**：分角色 token + 每台 client 独立 token（白名单实时重读）；server 只放行 client 的指令响应类消息（exec-output / exec-exit / file-content / done），client 无法伪造 `clients` / `whitelist` 等服务端消息；当前传输为明文 ws，如需公网加密可前置 nginx TLS 或改 wss。
 - **本地代理环境注意**：若本机开启 TUN 模式代理，需将服务器 IP 加入直连规则，否则 WebSocket 连接会被代理干扰。
