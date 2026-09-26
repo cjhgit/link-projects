@@ -1,11 +1,13 @@
 import './env';
 import { WebSocketServer, WebSocket } from 'ws';
+import http from 'node:http';
 import https from 'node:https';
 import { spawn, type ChildProcess } from 'node:child_process';
-import { existsSync, readFileSync, writeFileSync, renameSync } from 'node:fs';
+import { existsSync, readFileSync, writeFileSync, renameSync, createReadStream } from 'node:fs';
+import type { Stats } from 'node:fs';
 import { readFile, writeFile, rm, mkdir, readdir, stat } from 'node:fs/promises';
 import { homedir } from 'node:os';
-import { join, dirname } from 'node:path';
+import { join, dirname, resolve, basename, extname, sep } from 'node:path';
 import type {
   AnyMsg,
   RegisterMsg,
@@ -21,6 +23,15 @@ const TLS_PORT = Number(process.env.TLS_PORT || 9601);
 const CONTROLLER_TOKEN = process.env.CONTROLLER_TOKEN || '';
 // client 白名单文件（clientId -> 专属 token），默认放在项目根目录
 const CLIENTS_FILE = process.env.CLIENTS_FILE || join(__dirname, '..', 'clients.json');
+// 免鉴权 public 目录（配置后启用 http 文件服务，空则不启用）
+const PUBLIC_DIR_RAW = process.env.PUBLIC_DIR || '';
+// 支持 ~ 展开与相对路径（相对 server 项目根目录，与 CLIENTS_FILE 的基准一致）
+const PUBLIC_DIR = !PUBLIC_DIR_RAW ? '' : resolve(
+  __dirname, '..',
+  PUBLIC_DIR_RAW === '~' || PUBLIC_DIR_RAW.startsWith('~/')
+    ? join(homedir(), PUBLIC_DIR_RAW.slice(1))
+    : PUBLIC_DIR_RAW,
+);
 // 自身版本（package.json 的 version，dev 与 dist 两种运行方式下 package.json 都在上级目录）
 const VERSION: string = JSON.parse(readFileSync(join(__dirname, '..', 'package.json'), 'utf8')).version;
 
@@ -187,6 +198,153 @@ async function serverFileDelete(ws: WebSocket, msg: any) {
   } catch (err: any) {
     serverReply(ws, msg, { type: 'done', ok: false, error: err.message });
   }
+}
+
+// ---------- 免鉴权 public 目录 HTTP 文件服务（配置 PUBLIC_DIR 后启用） ----------
+// 浏览器直接访问 http://<服务器IP>:<PORT>/ 浏览/下载该目录，无任何鉴权，只应放置可公开的文件。
+// 与 ws 共用监听端口（HTTP 请求与 WebSocket 升级可同端口并存）；配置 TLS 时 https 端口同样提供服务。
+
+// 常见扩展名 -> Content-Type；未命中的按 attachment 下发，避免未知类型被浏览器当文本渲染
+const MIME: Record<string, string> = {
+  '.html': 'text/html; charset=utf-8', '.htm': 'text/html; charset=utf-8',
+  '.css': 'text/css; charset=utf-8',
+  '.js': 'text/javascript; charset=utf-8', '.mjs': 'text/javascript; charset=utf-8',
+  '.json': 'application/json; charset=utf-8',
+  '.txt': 'text/plain; charset=utf-8', '.md': 'text/markdown; charset=utf-8',
+  '.xml': 'application/xml; charset=utf-8',
+  '.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg',
+  '.gif': 'image/gif', '.svg': 'image/svg+xml', '.webp': 'image/webp', '.ico': 'image/x-icon',
+  '.pdf': 'application/pdf',
+  '.mp4': 'video/mp4', '.webm': 'video/webm',
+  '.mp3': 'audio/mpeg', '.wav': 'audio/wav',
+  '.zip': 'application/zip', '.gz': 'application/gzip', '.tar': 'application/x-tar',
+};
+
+function humanSize(n: number): string {
+  if (n < 1024) return `${n} B`;
+  const units = ['KB', 'MB', 'GB', 'TB'];
+  let v = n;
+  let i = -1;
+  do { v /= 1024; i++; } while (v >= 1024 && i < units.length - 1);
+  return `${v >= 100 ? Math.round(v) : v.toFixed(1)} ${units[i]}`;
+}
+
+// 目录浏览页（目录在前、名称自然排序，与 @server 文件列表的排序规则一致）
+async function renderDirIndex(absDir: string, urlPath: string): Promise<string> {
+  const dirents = await readdir(absDir, { withFileTypes: true });
+  const rows = await Promise.all(dirents.map(async (d) => {
+    let isDir = d.isDirectory();
+    let size = '-';
+    let mtime = '-';
+    try {
+      const st = await stat(join(absDir, d.name));
+      isDir = st.isDirectory();
+      if (!isDir) size = humanSize(st.size);
+      mtime = new Date(st.mtimeMs).toISOString().replace('T', ' ').slice(0, 16) + ' UTC';
+    } catch { /* 删除竞态等，保留粗略信息 */ }
+    return { name: d.name, isDir, size, mtime };
+  }));
+  rows.sort((a, b) =>
+    Number(b.isDir) - Number(a.isDir) ||
+    a.name.localeCompare(b.name, undefined, { numeric: true, sensitivity: 'base' })
+  );
+  const esc = (s: string) =>
+    s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+  const up = urlPath !== '/' ? '<tr><td><a href="../">../</a></td><td>-</td><td>-</td></tr>' : '';
+  const items = rows.map((r) => {
+    // 相对链接（当前目录 URL 已带尾斜杠），中文/空格等经 encodeURIComponent 编码
+    const href = encodeURIComponent(r.name) + (r.isDir ? '/' : '');
+    return `<tr><td><a href="${href}">${esc(r.name)}${r.isDir ? '/' : ''}</a></td><td>${r.size}</td><td>${r.mtime}</td></tr>`;
+  }).join('\n');
+  return `<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>${esc(urlPath)}</title>
+<style>
+  body { font-family: -apple-system, "PingFang SC", sans-serif; margin: 2rem 1rem; }
+  main { max-width: 48rem; margin: 0 auto; }
+  h1 { font-size: 1.1rem; word-break: break-all; }
+  table { width: 100%; border-collapse: collapse; font-size: 0.9rem; }
+  td { padding: 0.35rem 0.6rem; border-bottom: 1px solid #eee; white-space: nowrap; }
+  td:first-child { white-space: normal; word-break: break-all; }
+  td:nth-child(2), td:nth-child(3) { color: #888; text-align: right; font-variant-numeric: tabular-nums; }
+  a { color: #0366d6; text-decoration: none; } a:hover { text-decoration: underline; }
+</style>
+</head>
+<body>
+<main>
+<h1>/${esc(urlPath.replace(/^\//, ''))}</h1>
+<table>
+${up}
+${items}
+</table>
+</main>
+</body>
+</html>`;
+}
+
+// 文件响应：流式发送；未知扩展名带 Content-Disposition 按下载处理（RFC 5987 编码中文文件名）
+function sendFile(abs: string, st: Stats, req: http.IncomingMessage, res: http.ServerResponse) {
+  const type = MIME[extname(abs).toLowerCase()] || 'application/octet-stream';
+  const headers: Record<string, string | number> = {
+    'Content-Type': type,
+    'Content-Length': st.size,
+    'Last-Modified': st.mtime.toUTCString(),
+    'X-Content-Type-Options': 'nosniff',
+  };
+  if (type === 'application/octet-stream') {
+    headers['Content-Disposition'] = `attachment; filename*=UTF-8''${encodeURIComponent(basename(abs))}`;
+  }
+  res.writeHead(200, headers);
+  if (req.method === 'HEAD') return res.end();
+  const stream = createReadStream(abs);
+  stream.on('error', () => res.destroy());
+  stream.pipe(res);
+}
+
+// HTTP 请求统一入口：未配置 PUBLIC_DIR 一律 404；配置后提供目录浏览 + 文件下载
+function publicHttpHandler(req: http.IncomingMessage, res: http.ServerResponse) {
+  const done = (status: number, body: string, headers: Record<string, string> = {}) => {
+    res.writeHead(status, { 'Content-Type': 'text/plain; charset=utf-8', ...headers });
+    res.end(req.method === 'HEAD' ? undefined : body);
+  };
+  if (!PUBLIC_DIR) return done(404, 'public 文件服务未启用（未配置 PUBLIC_DIR）\n');
+  if (req.method !== 'GET' && req.method !== 'HEAD') return done(405, '只支持 GET\n', { Allow: 'GET, HEAD' });
+
+  let rel: string;
+  try {
+    rel = decodeURIComponent((req.url || '/').split('?')[0]);
+  } catch {
+    return done(400, 'URL 编码非法\n');
+  }
+  // resolve 规范化 .. 等路径段后必须仍位于 PUBLIC_DIR 内，防目录穿越
+  const abs = resolve(PUBLIC_DIR, `.${rel}`);
+  if (abs !== PUBLIC_DIR && !abs.startsWith(PUBLIC_DIR + sep)) return done(403, '禁止访问目录外路径\n');
+
+  stat(abs).then(async (st) => {
+    if (st.isDirectory()) {
+      const reqPath = (req.url || '/').split('?')[0];
+      // 目录无尾斜杠先 301 补上，保证页内相对链接不错位
+      if (!reqPath.endsWith('/')) {
+        res.writeHead(301, { Location: reqPath + '/' });
+        return res.end();
+      }
+      // 存在 index.html 时直接作为目录首页（可用来放静态网页）
+      const indexFile = join(abs, 'index.html');
+      try {
+        const ist = await stat(indexFile);
+        if (ist.isFile()) return sendFile(indexFile, ist, req, res);
+      } catch { /* 无 index.html，列目录 */ }
+      const html = await renderDirIndex(abs, rel);
+      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'X-Content-Type-Options': 'nosniff' });
+      res.end(req.method === 'HEAD' ? undefined : html);
+      return;
+    }
+    if (!st.isFile()) return done(404, '不是文件或目录\n');
+    sendFile(abs, st, req, res);
+  }).catch(() => done(404, '文件不存在\n'));
 }
 
 function send(ws: WebSocket, msg: AnyMsg) {
@@ -396,17 +554,29 @@ function onConnection(ws: WebSocket) {
   });
 }
 
-const wss = new WebSocketServer({ port: PORT });
-console.log(`[server] 监听端口 ${PORT}（ws://）`);
+// ws 与 public 文件服务共用同一 HTTP 端口：普通请求走文件服务，WebSocket 升级走 ws
+const httpServer = http.createServer(publicHttpHandler);
+const wss = new WebSocketServer({ server: httpServer });
+httpServer.listen(PORT, () => {
+  console.log(`[server] 监听端口 ${PORT}（ws://${PUBLIC_DIR ? ' + http 文件服务' : ''}）`);
+});
 wss.on('connection', onConnection);
 
-// wss://（TLS 加密）：client/controller 把地址换成 wss://<证书域名>:<TLS_PORT> 即用
+// PUBLIC_DIR 启用提示（目录不存在时自动创建）
+if (PUBLIC_DIR) {
+  mkdir(PUBLIC_DIR, { recursive: true }).then(
+    () => console.log(`[public] 免鉴权文件服务: ${PUBLIC_DIR} -> http://<服务器IP>:${PORT}/`),
+    (err) => console.error(`[public] 目录创建失败，文件服务不可用: ${(err as Error).message}`),
+  );
+}
+
+// wss://（TLS 加密）：client/controller 把地址换成 wss://<证书域名>:<TLS_PORT> 即用；https 端口同样提供文件服务
 if (TLS_CERT && TLS_KEY) {
   try {
     const httpsServer = https.createServer({
       cert: readFileSync(TLS_CERT),
       key: readFileSync(TLS_KEY),
-    });
+    }, publicHttpHandler);
     httpsServer.on('error', (err) => {
       console.error(`[server] wss 监听失败: ${(err as Error).message}`);
       process.exit(1);

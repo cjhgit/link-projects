@@ -37,6 +37,7 @@
 | `CLIENTS_FILE` | server | client 白名单文件路径 | `<项目根>/clients.json` |
 | `ALLOW_SERVER_FILES` | server | 是否允许 controller 浏览服务器本机文件（`@server` 目标），设 `0` 禁用 | `1`（允许） |
 | `ALLOW_SERVER_EXEC` | server | 是否允许 controller 在服务器本机执行命令（`@server` 目标），设 `0` 禁用 | `1`（允许） |
+| `PUBLIC_DIR` | server | 免鉴权 public 目录，配置后 `PORT` 端口同时提供 http 文件服务（浏览器访问 `http://<IP>:<PORT>/` 即可浏览下载，无鉴权；支持 `~` 与相对路径，目录自动创建） | 无（不启用） |
 | `TLS_PORT` | server | wss:// 加密监听端口，配置 `TLS_CERT`+`TLS_KEY` 后启用，与 ws 并存（安全组需放行） | 9601 |
 | `TLS_CERT` | server | TLS 证书路径（含完整链），与 `TLS_KEY` 同时配置才生效 | 无 |
 | `TLS_KEY` | server | TLS 私钥路径 | 无 |
@@ -153,4 +154,5 @@ run       前台运行，调试排查用（Ctrl+C 退出）
 - **更新 server 代码**：服务器上 `cd /root/projects/link-projects && git pull && cd server && npm install && npm run build && systemctl restart link-server`。部署改为从 GitHub 拉取（systemd 托管：开机自启、崩溃自动拉起）；客户端管理（白名单增删改）与服务器本机文件浏览（`@server`）需要 server 为新版，旧版 server 会把这些消息当普通转发而报「客户端不在线」。
 - **更新 client 代码**：云电脑上 `npm run build && npm restart`。
 - **安全**：分角色 token + 每台 client 独立 token（白名单实时重读）；server 只放行 client 的指令响应类消息（exec-output / exec-exit / file-content / done），client 无法伪造 `clients` / `whitelist` 等服务端消息；当前传输为明文 ws，如需公网加密可前置 nginx TLS 或改 wss。
+- **public 文件服务**：server 配置 `PUBLIC_DIR` 后，`PORT` 端口在 ws 之外同时提供**免鉴权** http 文件服务（目录浏览 + 下载，配了 TLS 则 `TLS_PORT` 同样提供 https 版），任何人可读——只应放置可公开分享的文件；已做 `..` 路径穿越防护，服务范围严格限定在该目录内。
 - **本地代理环境注意**：若本机开启 TUN 模式代理，需将服务器 IP 加入直连规则，否则 WebSocket 连接会被代理干扰。
