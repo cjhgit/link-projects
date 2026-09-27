@@ -1,9 +1,9 @@
 import AppKit
 import SwiftUI
 
-/// 为 SwiftUI 创建的 NSSplitView 持久化分隔栏位置。
-/// SwiftUI 切换 Tab 时会销毁并重建 HSplitView，因此除 AppKit 自动保存外，
-/// 还需在每次拖动后立刻记录宽度，确保本次运行内也能正确恢复。
+/// 持久化 SwiftUI 生成的 NSSplitView。
+/// NavigationSplitView 在 macOS 上可能生成嵌套的 NSSplitView；每一层都保存除最后一栏外的
+/// 分隔条位置，以保证窗口重开或右侧详情区变化时，所有左侧栏宽保持用户最后调整的值。
 struct PersistedSplitView: NSViewRepresentable {
     let autosaveName: NSSplitView.AutosaveName
 
@@ -20,64 +20,109 @@ struct PersistedSplitView: NSViewRepresentable {
     func makeCoordinator() -> Coordinator { Coordinator() }
 
     private func attach(to view: NSView, coordinator: Coordinator) {
+        // SwiftUI 会在当前更新周期内继续搭建 NavigationSplitView；延后至下一轮主循环，
+        // 才能取得稳定的尺寸，避免把初始的临时宽度当作用户设置保存。
         DispatchQueue.main.async {
-            guard let splitView = nearestSplitView(from: view) else { return }
-            guard coordinator.splitView !== splitView || coordinator.autosaveName != autosaveName else { return }
-            coordinator.stopObserving()
-            splitView.autosaveName = autosaveName
-            coordinator.splitView = splitView
-            coordinator.autosaveName = autosaveName
-            coordinator.restoreWidths()
-            coordinator.startObserving()
+            coordinator.attach(splitViews: splitViews(around: view), baseName: String(autosaveName))
         }
     }
 
-    private func nearestSplitView(from view: NSView) -> NSSplitView? {
-        sequence(first: view.superview, next: { $0?.superview })
+    private func splitViews(around view: NSView) -> [NSSplitView] {
+        let ancestors = sequence(first: view.superview, next: { $0?.superview })
             .compactMap { $0 as? NSSplitView }
-            .first
+        guard let root = ancestors.last else { return [] }
+
+        var result: [NSSplitView] = []
+        func collect(from node: NSView) {
+            if let splitView = node as? NSSplitView {
+                result.append(splitView)
+            }
+            node.subviews.forEach(collect)
+        }
+        collect(from: root)
+        return result
     }
 
     final class Coordinator {
-        weak var splitView: NSSplitView?
-        var autosaveName: NSSplitView.AutosaveName?
-        private var resizeObserver: NSObjectProtocol?
+        private final class SplitState {
+            weak var splitView: NSSplitView?
+            let storageKey: String
+            var resizeObserver: NSObjectProtocol?
 
-        private var storageKey: String? {
-            autosaveName.map { "link-projects.split-view-widths.\($0)" }
+            init(splitView: NSSplitView, storageKey: String) {
+                self.splitView = splitView
+                self.storageKey = storageKey
+            }
         }
 
-        func restoreWidths() {
-            guard let splitView, let storageKey,
-                  let widths = UserDefaults.standard.array(forKey: storageKey) as? [Double],
-                  widths.count == splitView.subviews.count - 1 else { return }
-            DispatchQueue.main.async {
-                for (index, width) in widths.enumerated() {
-                    splitView.setPosition(CGFloat(width), ofDividerAt: index)
+        private var states: [SplitState] = []
+        private var identity: [ObjectIdentifier] = []
+
+        func attach(splitViews: [NSSplitView], baseName: String) {
+            let newIdentity = splitViews.map(ObjectIdentifier.init)
+            guard newIdentity != identity else { return }
+
+            stopObserving()
+            identity = newIdentity
+            states = splitViews.enumerated().map { index, splitView in
+                // 不启用 AppKit autosave，防止它和自定义恢复在启动阶段发生竞争。
+                splitView.autosaveName = nil
+                return SplitState(
+                    splitView: splitView,
+                    // v3 覆盖旧版错误的“栏宽”格式，也隔离此前只保存单层的记录。
+                    storageKey: "link-projects.split-view-divider-positions.v3.\(baseName).\(index)"
+                )
+            }
+
+            // 恢复完成前不监听 resize，避免恢复过程触发通知又把临时布局写回。
+            DispatchQueue.main.async { [weak self] in
+                self?.restoreDividerPositions()
+                self?.startObserving()
+            }
+        }
+
+        private func restoreDividerPositions() {
+            for state in states {
+                guard let splitView = state.splitView,
+                      let positions = UserDefaults.standard.array(forKey: state.storageKey) as? [Double],
+                      positions.count == splitView.subviews.count - 1 else { continue }
+                for (index, position) in positions.enumerated() {
+                    splitView.setPosition(CGFloat(position), ofDividerAt: index)
                 }
             }
         }
 
-        func startObserving() {
-            guard let splitView else { return }
-            resizeObserver = NotificationCenter.default.addObserver(
-                forName: NSSplitView.didResizeSubviewsNotification,
-                object: splitView,
-                queue: .main
-            ) { [weak self] _ in
-                self?.saveWidths()
+        private func startObserving() {
+            for state in states {
+                guard let splitView = state.splitView else { continue }
+                state.resizeObserver = NotificationCenter.default.addObserver(
+                    forName: NSSplitView.didResizeSubviewsNotification,
+                    object: splitView,
+                    queue: .main
+                ) { [weak self, weak state] _ in
+                    guard let state else { return }
+                    self?.saveDividerPositions(for: state)
+                }
             }
         }
 
-        func stopObserving() {
-            if let resizeObserver { NotificationCenter.default.removeObserver(resizeObserver) }
-            resizeObserver = nil
+        private func stopObserving() {
+            for state in states {
+                if let observer = state.resizeObserver {
+                    NotificationCenter.default.removeObserver(observer)
+                }
+                state.resizeObserver = nil
+            }
         }
 
-        private func saveWidths() {
-            guard let splitView, let storageKey else { return }
-            let widths = splitView.subviews.dropLast().map { Double($0.frame.width) }
-            UserDefaults.standard.set(widths, forKey: storageKey)
+        private func saveDividerPositions(for state: SplitState) {
+            guard let splitView = state.splitView else { return }
+            let positions = (0..<(splitView.subviews.count - 1)).map {
+                // 第 index 个子视图右边缘即第 index 根分隔条的绝对坐标，
+                // 与 NSSplitView.setPosition(_:ofDividerAt:) 使用同一坐标体系。
+                Double(splitView.subviews[$0].frame.maxX)
+            }
+            UserDefaults.standard.set(positions, forKey: state.storageKey)
         }
 
         deinit { stopObserving() }
@@ -85,7 +130,7 @@ struct PersistedSplitView: NSViewRepresentable {
 }
 
 extension View {
-    /// 持久化当前视图所在分隔布局的用户调整宽度。
+    /// 持久化当前视图所在的整组嵌套分栏布局。
     func persistedSplitView(_ autosaveName: NSSplitView.AutosaveName) -> some View {
         background(PersistedSplitView(autosaveName: autosaveName))
     }

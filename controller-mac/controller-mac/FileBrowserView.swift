@@ -1,4 +1,5 @@
 import SwiftUI
+import WebKit
 
 // 详情区工作模式：项目 / 终端 / 文件浏览器（对当前选中的客户端）
 enum DetailTab: Hashable {
@@ -478,8 +479,12 @@ struct FileViewerView: View {
     @State private var readOnlyReason: String? // 二进制 / 超大文件只读的原因
     @State private var confirmClose = false
     @State private var confirmReload = false
+    @State private var showingHTMLPreview = false
 
     private var isDirty: Bool { content != savedContent }
+    private var supportsHTMLPreview: Bool {
+        ["html", "htm"].contains((path as NSString).pathExtension.lowercased())
+    }
 
     var body: some View {
         VStack(spacing: 0) {
@@ -533,6 +538,11 @@ struct FileViewerView: View {
                     .font(.caption)
                     .foregroundStyle(.orange)
             }
+            if supportsHTMLPreview {
+                Button(showingHTMLPreview ? "编辑源码" : "网页预览") {
+                    showingHTMLPreview.toggle()
+                }
+            }
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 8)
@@ -553,6 +563,8 @@ struct FileViewerView: View {
                 Button("重试", action: reload)
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
+        } else if supportsHTMLPreview && showingHTMLPreview {
+            HTMLPreviewView(html: content)
         } else {
             VStack(spacing: 0) {
                 if let readOnlyReason {
@@ -608,6 +620,7 @@ struct FileViewerView: View {
                 content = text
                 savedContent = text
                 readOnlyReason = Self.readOnlyReason(for: text)
+                showingHTMLPreview = supportsHTMLPreview
             case .failed(let error):
                 loadError = error
             }
@@ -653,6 +666,23 @@ struct FileViewerView: View {
         if Double(replacements) / Double(text.count) > 0.01 { return "内容疑似非 UTF-8 文本" }
         if text.count > 1_000_000 { return "文件超过 1M 字符" }
         return nil
+    }
+}
+
+// MARK: - HTML 预览
+
+private struct HTMLPreviewView: NSViewRepresentable {
+    let html: String
+
+    func makeNSView(context: Context) -> WKWebView {
+        let configuration = WKWebViewConfiguration()
+        configuration.defaultWebpagePreferences.allowsContentJavaScript = true
+        return WKWebView(frame: .zero, configuration: configuration)
+    }
+
+    func updateNSView(_ webView: WKWebView, context: Context) {
+        // 文件内容通过协议读取，无法直接映射远端目录；内嵌 CSS/JS 与 HTTPS 资源可正常呈现。
+        webView.loadHTMLString(html, baseURL: nil)
     }
 }
 
