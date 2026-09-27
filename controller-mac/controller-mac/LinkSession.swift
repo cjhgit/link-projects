@@ -42,6 +42,9 @@ final class LinkSession: NSObject, URLSessionWebSocketDelegate {
     private var manageCallbacks: [String: (String?) -> Void] = [:]
     // 文件操作请求的回调（reqId -> 回执），file-listing/file-content/done/error 按此路由到文件界面
     private var fileCallbacks: [String: (FileReply) -> Void] = [:]
+    // Agent 请求同样以 reqId 关联，断线后不会依赖回调；界面可重新拉取 client 本机快照。
+    private var agentCallbacks: [String: ([AgentSessionInfo]) -> Void] = [:]
+    private var agentUpdateHandlers: [String: ([AgentSessionInfo]) -> Void] = [:]
 
     private static let maxLines = 5000
     private static let targetsKey = "LINK_TARGETS" // 每个服务端各自记住的目标客户端 [serverId: clientId]
@@ -138,6 +141,8 @@ final class LinkSession: NSObject, URLSessionWebSocketDelegate {
         let pendingFiles = fileCallbacks
         fileCallbacks.removeAll()
         for callback in pendingFiles.values { callback(.failure("连接已断开")) }
+        agentCallbacks.removeAll()
+        agentUpdateHandlers.removeAll()
     }
 
     // MARK: - WebSocket 收发
@@ -312,7 +317,49 @@ final class LinkSession: NSObject, URLSessionWebSocketDelegate {
             }
             append("[错误] \(message)", .system)
             appendSeparator()
+
+        case .agentSessions(let reqId, let targetId, let sessions):
+            if let callback = agentCallbacks.removeValue(forKey: reqId) { callback(sessions) }
+            else { agentUpdateHandlers[targetId]?(sessions) }
         }
+    }
+
+    // MARK: - Claude Code 会话（会话数据在 client 本机持久化，不在 server 保存）
+
+    func listAgentSessions(targetId: String, completion: @escaping ([AgentSessionInfo]) -> Void) {
+        guard state == .connected else { completion([]); return }
+        let reqId = UUID().uuidString
+        agentCallbacks[reqId] = completion
+        send(OutgoingMessage.agentList(reqId: reqId, targetId: targetId))
+    }
+
+    func runAgent(targetId: String, prompt: String, sessionId: String? = nil, cwd: String? = nil, completion: @escaping ([AgentSessionInfo]) -> Void) {
+        guard state == .connected else { completion([]); return }
+        let reqId = UUID().uuidString
+        agentCallbacks[reqId] = completion
+        send(OutgoingMessage.agentRun(reqId: reqId, targetId: targetId, prompt: prompt, sessionId: sessionId, cwd: cwd))
+    }
+
+    func agentStatus(targetId: String, sessionId: String, completion: @escaping ([AgentSessionInfo]) -> Void) {
+        guard state == .connected else { completion([]); return }
+        let reqId = UUID().uuidString
+        agentCallbacks[reqId] = completion
+        send(OutgoingMessage.agentStatus(reqId: reqId, targetId: targetId, sessionId: sessionId))
+    }
+
+    func observeAgentUpdates(targetId: String, handler: @escaping ([AgentSessionInfo]) -> Void) {
+        agentUpdateHandlers[targetId] = handler
+    }
+
+    func stopObservingAgentUpdates(targetId: String) {
+        agentUpdateHandlers[targetId] = nil
+    }
+
+    func deleteAgentSession(targetId: String, sessionId: String, completion: @escaping ([AgentSessionInfo]) -> Void) {
+        guard state == .connected else { completion([]); return }
+        let reqId = UUID().uuidString
+        agentCallbacks[reqId] = completion
+        send(OutgoingMessage.agentDelete(reqId: reqId, targetId: targetId, sessionId: sessionId))
     }
 
     // MARK: - 输入处理（对齐 handleLine）

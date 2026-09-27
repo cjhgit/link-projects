@@ -133,6 +133,67 @@ export interface ErrorMsg {
   message: string;
 }
 
+// ===== Claude Code 会话（会话记录只保存在 client 本机） =====
+export type AgentSessionState = 'running' | 'completed' | 'failed';
+
+export interface AgentMessage {
+  role: 'user' | 'assistant';
+  content: string;
+  createdAt: number;
+}
+
+export interface AgentSession {
+  sessionId: string; // 同时作为 Claude Code --session-id / --resume 的 ID
+  title: string;
+  cwd?: string;
+  state: AgentSessionState;
+  createdAt: number;
+  updatedAt: number;
+  error?: string;
+  messages: AgentMessage[];
+}
+
+// 查询该云电脑本机持久化的会话列表；可在网络恢复后再次请求
+export interface AgentListMsg {
+  type: 'agent-list';
+  reqId: string;
+  targetId: string;
+}
+
+// 新建会话（不传 sessionId）或在既有 Claude 会话中继续对话（传 sessionId）
+export interface AgentRunMsg {
+  type: 'agent-run';
+  reqId: string;
+  targetId: string;
+  prompt: string;
+  sessionId?: string;
+  cwd?: string;
+}
+
+// 刷新单个会话的状态及完整消息记录
+export interface AgentStatusMsg {
+  type: 'agent-status';
+  reqId: string;
+  targetId: string;
+  sessionId: string;
+}
+
+// 仅删除 client 本机 Link 会话记录；不会删除 Claude Code 自己保存的会话。
+export interface AgentDeleteMsg {
+  type: 'agent-delete';
+  reqId: string;
+  targetId: string;
+  sessionId: string;
+}
+
+// client 返回列表或单个会话的快照；不会由 server 持久化
+export interface AgentSessionsMsg {
+  type: 'agent-sessions';
+  reqId: string;
+  targetId: string;
+  sessions: AgentSession[];
+}
+
 // ===== 客户端白名单管理（controller -> server 直接处理，响应也由 server 回给 controller） =====
 
 // 查询服务端 clients.json 全量白名单
@@ -171,7 +232,7 @@ export interface ClientRemoveMsg {
   clientId: string;
 }
 
-export type ClientToServerMsg = RegisterMsg | ExecOutputMsg | ExecExitMsg | FileContentMsg | FileListingMsg | DoneMsg;
+export type ClientToServerMsg = RegisterMsg | ExecOutputMsg | ExecExitMsg | FileContentMsg | FileListingMsg | DoneMsg | AgentSessionsMsg;
 export type ServerMsg =
   | RegisteredMsg
   | ClientsMsg
@@ -181,6 +242,11 @@ export type ServerMsg =
   | FileCreateMsg
   | FileDeleteMsg
   | FileListMsg
+  | AgentListMsg
+  | AgentRunMsg
+  | AgentStatusMsg
+  | AgentDeleteMsg
+  | AgentSessionsMsg
   | DoneMsg
   | WhitelistMsg
   | ErrorMsg;

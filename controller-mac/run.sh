@@ -18,6 +18,7 @@ xcodebuild \
     -destination 'platform=macOS' \
     -configuration Debug \
     -derivedDataPath build \
+    CODE_SIGNING_ALLOWED=NO \
     -quiet
 
 echo "[run] 启动..."

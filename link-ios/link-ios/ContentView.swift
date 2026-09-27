@@ -397,6 +397,7 @@ private struct WorkspaceView: View {
                 Picker("工作模式", selection: $tab) {
                     Text("终端").tag(DetailTab.terminal)
                     Text("文件").tag(DetailTab.files)
+                    Text("Agent").tag(DetailTab.agent)
                 }
                 .pickerStyle(.segmented)
                 .padding(.horizontal, 12)
@@ -407,6 +408,8 @@ private struct WorkspaceView: View {
                     TerminalView(session: session)
                 case .files:
                     FileBrowserView(session: session, path: "~", resetsOnTargetChange: true)
+                case .agent:
+                    AgentView(session: session)
                 }
             }
             .navigationTitle(session.currentTargetDisplay)

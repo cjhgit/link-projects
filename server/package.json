@@ -1,6 +1,6 @@
 {
   "name": "link-server",
-  "version": "26.9.2600",
+  "version": "26.9.2701",
   "private": true,
   "description": "远程控制中继服务端：部署在公网服务器，转发 controller 与 client 之间的消息",
   "scripts": {

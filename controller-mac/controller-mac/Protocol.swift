@@ -61,6 +61,32 @@ nonisolated enum FileOutcome<Value> {
     case failed(String)
 }
 
+// Claude Code 会话快照；真实持久化文件仅位于云电脑 client 的 ~/.link-projects/claude-sessions.json。
+nonisolated enum AgentSessionState: String, Equatable {
+    case running
+    case completed
+    case failed
+}
+
+nonisolated struct AgentMessageInfo: Identifiable, Equatable {
+    let role: String
+    let content: String
+    let createdAt: Double
+    var id: String { "\(role)-\(createdAt)-\(content.hashValue)" }
+}
+
+nonisolated struct AgentSessionInfo: Identifiable, Equatable {
+    let sessionId: String
+    let title: String
+    let cwd: String?
+    let state: AgentSessionState
+    let createdAt: Double
+    let updatedAt: Double
+    let error: String?
+    let messages: [AgentMessageInfo]
+    var id: String { sessionId }
+}
+
 // 输出条目类型：stdout/stderr 为命令输出，system 为本地系统消息，command 为输入回显，separator 为每次交互结束的分隔线
 nonisolated enum OutputKind: Equatable {
     case stdout
@@ -88,6 +114,7 @@ nonisolated enum IncomingMessage {
     case fileListing(reqId: String, path: String, entries: [FileEntryInfo]?, error: String?, targetId: String)
     case done(reqId: String, ok: Bool, error: String?, targetId: String)
     case error(reqId: String?, message: String)
+    case agentSessions(reqId: String, targetId: String, sessions: [AgentSessionInfo])
 
     static func parse(_ text: String) -> IncomingMessage? {
         guard let data = text.data(using: .utf8),
@@ -170,6 +197,22 @@ nonisolated enum IncomingMessage {
                 reqId: obj["reqId"] as? String,
                 message: obj["message"] as? String ?? "未知错误"
             )
+        case "agent-sessions":
+            let sessions = (obj["sessions"] as? [[String: Any]] ?? []).map { item in
+                AgentSessionInfo(
+                    sessionId: item["sessionId"] as? String ?? "",
+                    title: item["title"] as? String ?? "未命名会话",
+                    cwd: item["cwd"] as? String,
+                    state: AgentSessionState(rawValue: item["state"] as? String ?? "") ?? .failed,
+                    createdAt: item["createdAt"] as? Double ?? 0,
+                    updatedAt: item["updatedAt"] as? Double ?? 0,
+                    error: item["error"] as? String,
+                    messages: (item["messages"] as? [[String: Any]] ?? []).map {
+                        AgentMessageInfo(role: $0["role"] as? String ?? "assistant", content: $0["content"] as? String ?? "", createdAt: $0["createdAt"] as? Double ?? 0)
+                    }
+                )
+            }
+            return .agentSessions(reqId: obj["reqId"] as? String ?? "", targetId: obj["targetId"] as? String ?? "", sessions: sessions)
         default:
             return nil
         }
@@ -208,6 +251,25 @@ nonisolated enum OutgoingMessage {
 
     static func fileList(reqId: String, targetId: String, path: String) -> String {
         json(["type": "file-list", "reqId": reqId, "targetId": targetId, "path": path])
+    }
+
+    static func agentList(reqId: String, targetId: String) -> String {
+        json(["type": "agent-list", "reqId": reqId, "targetId": targetId])
+    }
+
+    static func agentRun(reqId: String, targetId: String, prompt: String, sessionId: String?, cwd: String?) -> String {
+        var value: [String: Any] = ["type": "agent-run", "reqId": reqId, "targetId": targetId, "prompt": prompt]
+        if let sessionId { value["sessionId"] = sessionId }
+        if let cwd, !cwd.isEmpty { value["cwd"] = cwd }
+        return json(value)
+    }
+
+    static func agentStatus(reqId: String, targetId: String, sessionId: String) -> String {
+        json(["type": "agent-status", "reqId": reqId, "targetId": targetId, "sessionId": sessionId])
+    }
+
+    static func agentDelete(reqId: String, targetId: String, sessionId: String) -> String {
+        json(["type": "agent-delete", "reqId": reqId, "targetId": targetId, "sessionId": sessionId])
     }
 
     // 白名单管理（server 直接处理，不带 targetId）

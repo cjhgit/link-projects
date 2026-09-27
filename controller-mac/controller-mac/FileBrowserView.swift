@@ -4,6 +4,7 @@ import SwiftUI
 enum DetailTab: Hashable {
     case terminal
     case files
+    case agent
 }
 
 // 已连接服务端的详情区：顶部切换终端 / 文件，各自独占剩余空间
@@ -16,9 +17,10 @@ struct WorkspaceView: View {
             Picker("工作模式", selection: $tab) {
                 Text("终端").tag(DetailTab.terminal)
                 Text("文件").tag(DetailTab.files)
+                Text("Agent").tag(DetailTab.agent)
             }
             .pickerStyle(.segmented)
-            .frame(width: 220)
+            .frame(width: 320)
             .padding(.vertical, 8)
             Divider()
             switch tab {
@@ -26,6 +28,8 @@ struct WorkspaceView: View {
                 TerminalView(session: session)
             case .files:
                 FileBrowserView(session: session)
+            case .agent:
+                AgentView(session: session)
             }
         }
     }

@@ -5,6 +5,7 @@ import UIKit
 enum DetailTab: Hashable {
     case terminal
     case files
+    case agent
 }
 
 // MARK: - 文件浏览器（浏览当前目标的目录：客户端或服务器主机 @server，点击目录进入、点击文件打开查看/编辑）

@@ -133,6 +133,16 @@ export interface ErrorMsg {
   message: string;
 }
 
+// ===== Claude Code 会话（会话记录只保存在 client 本机） =====
+export type AgentSessionState = 'running' | 'completed' | 'failed';
+export interface AgentMessage { role: 'user' | 'assistant'; content: string; createdAt: number; }
+export interface AgentSession { sessionId: string; title: string; cwd?: string; state: AgentSessionState; createdAt: number; updatedAt: number; error?: string; messages: AgentMessage[]; }
+export interface AgentListMsg { type: 'agent-list'; reqId: string; targetId: string; }
+export interface AgentRunMsg { type: 'agent-run'; reqId: string; targetId: string; prompt: string; sessionId?: string; cwd?: string; }
+export interface AgentStatusMsg { type: 'agent-status'; reqId: string; targetId: string; sessionId: string; }
+export interface AgentDeleteMsg { type: 'agent-delete'; reqId: string; targetId: string; sessionId: string; }
+export interface AgentSessionsMsg { type: 'agent-sessions'; reqId: string; targetId: string; sessions: AgentSession[]; }
+
 // ===== 客户端白名单管理（controller -> server 直接处理，响应也由 server 回给 controller） =====
 
 // 查询服务端 clients.json 全量白名单
@@ -171,7 +181,7 @@ export interface ClientRemoveMsg {
   clientId: string;
 }
 
-export type ClientToServerMsg = RegisterMsg | ExecOutputMsg | ExecExitMsg | FileContentMsg | FileListingMsg | DoneMsg;
+export type ClientToServerMsg = RegisterMsg | ExecOutputMsg | ExecExitMsg | FileContentMsg | FileListingMsg | DoneMsg | AgentSessionsMsg;
 export type ServerMsg =
   | RegisteredMsg
   | ClientsMsg
@@ -181,6 +191,7 @@ export type ServerMsg =
   | FileCreateMsg
   | FileDeleteMsg
   | FileListMsg
+  | AgentListMsg | AgentRunMsg | AgentStatusMsg | AgentDeleteMsg | AgentSessionsMsg
   | DoneMsg
   | WhitelistMsg
   | ErrorMsg;
