@@ -37,6 +37,7 @@ struct AgentView: View {
                     composer(targetId: targetId)
                 }
             }
+            .persistedSplitView("agent-session-columns")
             .toolbar {
                 Button { selectedId = nil; prompt = "" } label: { Image(systemName: "square.and.pencil") }.help("新建会话")
                 Button { confirmDelete = true } label: { Image(systemName: "trash") }

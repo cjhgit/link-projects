@@ -16,6 +16,7 @@ struct ContentView: View {
             DetailView()
         }
         .frame(minWidth: 880, minHeight: 460)
+        .persistedSplitView("main-navigation-columns")
         .sheet(item: $model.serverSheet) { sheet in
             ServerSheetView(sheet: sheet)
         }
