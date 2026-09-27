@@ -32,6 +32,16 @@ final class LinkSession: NSObject, URLSessionWebSocketDelegate {
             Self.saveTarget(currentTarget, for: server.id)
         }
     }
+    // 进行中的文件传输（上传 / 下载，一次一个）；nil = 空闲。UI 据此显示进度并禁用新传输
+    private(set) var transfer: TransferInfo?
+
+    // 传输进度快照；下载在首块到达前总大小未知（total = -1）
+    struct TransferInfo {
+        let isUpload: Bool
+        let fileName: String
+        var transferred: Int64 = 0
+        var total: Int64 = -1
+    }
 
     private var ws: URLSessionWebSocketTask?
     private var listRequested = false // 用户主动 /list，收到响应时打印详细列表
@@ -296,6 +306,13 @@ final class LinkSession: NSObject, URLSessionWebSocketDelegate {
                 } else {
                     callback(.failure("空响应"))
                 }
+            }
+
+        case .fileDownloadData(let reqId, _, let data, let done, let size, _):
+            // 下载分块：回调保留到 done（最后一条）才移除
+            if let callback = fileCallbacks[reqId] {
+                callback(.chunk(data: Data(base64Encoded: data) ?? Data(), done: done, size: size))
+                if done { fileCallbacks.removeValue(forKey: reqId) }
             }
 
         case .done(let reqId, let ok, let error, let targetId):
@@ -591,6 +608,118 @@ final class LinkSession: NSObject, URLSessionWebSocketDelegate {
             }
         }
         send(OutgoingMessage.fileDelete(reqId: reqId, targetId: target, path: path))
+    }
+
+    // MARK: - 文件上传 / 下载（本地 <-> 当前目标，分块 base64 走同一 ws 通道）
+
+    private static let transferChunkSize = 512 * 1024
+
+    /// 上传本地文件到当前目标的 remotePath（同名覆盖）；completion 参数为 nil 表示成功，否则为错误信息
+    func uploadFile(localURL: URL, remotePath: String, completion: @escaping (String?) -> Void) {
+        guard state == .connected else { return completion("未连接服务器") }
+        guard let target = currentTarget else { return completion("未选择客户端") }
+        let size: Int64
+        do {
+            size = try FileManager.default.attributesOfItem(atPath: localURL.path)[.size] as? Int64 ?? -1
+        } catch {
+            return completion("读取本地文件信息失败：\(error.localizedDescription)")
+        }
+        guard size >= 0, let handle = try? FileHandle(forReadingFrom: localURL) else {
+            return completion("无法打开本地文件")
+        }
+        let reqId = newReqId()
+        fileCallbacks[reqId] = { [weak self] reply in
+            switch reply {
+            case .ack(let ok, let error):
+                self?.transfer = nil
+                completion(ok ? nil : (error ?? "上传失败"))
+            case .failure(let error):
+                self?.transfer = nil
+                completion(error)
+            default:
+                break
+            }
+        }
+        transfer = TransferInfo(isUpload: true, fileName: localURL.lastPathComponent, total: size)
+        send(OutgoingMessage.fileUploadStart(reqId: reqId, targetId: target, path: remotePath, size: size))
+        // 逐块发送：等每条 send 完成再读下一块（背压），避免大文件整体堆在发送缓冲
+        Task { @MainActor [weak self] in
+            var offset: Int64 = 0
+            while let self, offset < size {
+                guard let data = try? handle.read(upToCount: Self.transferChunkSize), !data.isEmpty else { break }
+                let payload = OutgoingMessage.fileUploadChunk(
+                    reqId: reqId, targetId: target, offset: offset, data: data.base64EncodedString()
+                )
+                // 发送失败 = 连接已断，回执由 teardown 统一回调，这里只收尾句柄
+                guard await self.sendAwait(payload) else {
+                    try? handle.close()
+                    return
+                }
+                offset += Int64(data.count)
+                self.transfer?.transferred = offset
+            }
+            try? handle.close()
+            guard let self else { return }
+            self.send(OutgoingMessage.fileUploadFinish(reqId: reqId, targetId: target))
+        }
+    }
+
+    /// 下载当前目标的远程文件到 localURL（已存在则覆盖）；completion 参数为 nil 表示成功，否则为错误信息
+    func downloadFile(remotePath: String, localURL: URL, completion: @escaping (String?) -> Void) {
+        guard state == .connected else { return completion("未连接服务器") }
+        guard let target = currentTarget else { return completion("未选择客户端") }
+        try? FileManager.default.removeItem(at: localURL)
+        guard FileManager.default.createFile(atPath: localURL.path, contents: nil),
+              let handle = try? FileHandle(forWritingTo: localURL) else {
+            return completion("无法创建本地文件")
+        }
+        let reqId = newReqId()
+        let fileName = (remotePath as NSString).lastPathComponent
+        transfer = TransferInfo(isUpload: false, fileName: fileName)
+        var received: Int64 = 0
+        fileCallbacks[reqId] = { [weak self] reply in
+            switch reply {
+            case .chunk(let data, let done, let size):
+                do {
+                    try handle.write(contentsOf: data)
+                } catch {
+                    // 本地写入失败：主动移除回调，丢弃后续分块
+                    self?.fileCallbacks.removeValue(forKey: reqId)
+                    self?.transfer = nil
+                    try? handle.close()
+                    try? FileManager.default.removeItem(at: localURL)
+                    completion("写入本地文件失败：\(error.localizedDescription)")
+                    return
+                }
+                received += Int64(data.count)
+                self?.transfer = TransferInfo(
+                    isUpload: false, fileName: fileName, transferred: received, total: size
+                )
+                if done {
+                    self?.transfer = nil
+                    try? handle.close()
+                    completion(nil)
+                }
+            case .failure(let error):
+                self?.transfer = nil
+                try? handle.close()
+                try? FileManager.default.removeItem(at: localURL)
+                completion(error)
+            default:
+                break
+            }
+        }
+        send(OutgoingMessage.fileDownload(reqId: reqId, targetId: target, path: remotePath))
+    }
+
+    // 等待发送完成的 send（上传分块背压用）；返回 false = 连接已不可用
+    private func sendAwait(_ text: String) async -> Bool {
+        guard let task = ws else { return false }
+        return await withCheckedContinuation { continuation in
+            task.send(.string(text)) { error in
+                continuation.resume(returning: error == nil)
+            }
+        }
     }
 
     // MARK: - 客户端白名单管理（发给 server 直接处理，回执经 manageCallbacks 路由）

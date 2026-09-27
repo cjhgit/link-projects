@@ -127,6 +127,52 @@ export interface FileListingMsg {
   error?: string;
 }
 
+// ===== 文件上传 / 下载（本地 <-> 客户端之间传输，分块 base64 走同一 ws 通道） =====
+
+// controller -> client：上传开始；client 在目标同目录创建临时文件接收，收完原子替换
+export interface FileUploadStartMsg {
+  type: 'file-upload-start';
+  reqId: string;
+  targetId: string;
+  path: string; // 上传目标完整路径
+  size: number; // 总字节数
+}
+
+// controller -> client：上传数据块（按 offset 定位写，ws 有序到达保证顺序）
+export interface FileUploadChunkMsg {
+  type: 'file-upload-chunk';
+  reqId: string;
+  targetId: string;
+  offset: number;
+  data: string; // base64
+}
+
+// controller -> client：上传结束；client 校验大小并替换正式文件，以 done 回执
+export interface FileUploadFinishMsg {
+  type: 'file-upload-finish';
+  reqId: string;
+  targetId: string;
+}
+
+// controller -> client：下载文件，client 流式分块回传
+export interface FileDownloadMsg {
+  type: 'file-download';
+  reqId: string;
+  targetId: string;
+  path: string;
+}
+
+// client -> controller：下载数据块；done=true 为最后一条（空文件也有一条）
+export interface FileDownloadDataMsg {
+  type: 'file-download-data';
+  reqId: string;
+  targetId: string;
+  offset: number;
+  data: string; // base64
+  done: boolean;
+  size: number; // 文件总字节数
+}
+
 export interface ErrorMsg {
   type: 'error';
   reqId?: string;
@@ -274,7 +320,7 @@ export interface ClientRemoveMsg {
   clientId: string;
 }
 
-export type ClientToServerMsg = RegisterMsg | ExecOutputMsg | ExecExitMsg | FileContentMsg | FileListingMsg | DoneMsg | AgentSessionsMsg | ProjectsMsg;
+export type ClientToServerMsg = RegisterMsg | ExecOutputMsg | ExecExitMsg | FileContentMsg | FileListingMsg | DoneMsg | AgentSessionsMsg | ProjectsMsg | FileDownloadDataMsg;
 export type ServerMsg =
   | RegisteredMsg
   | ClientsMsg
@@ -284,6 +330,11 @@ export type ServerMsg =
   | FileCreateMsg
   | FileDeleteMsg
   | FileListMsg
+  | FileUploadStartMsg
+  | FileUploadChunkMsg
+  | FileUploadFinishMsg
+  | FileDownloadMsg
+  | FileDownloadDataMsg
   | AgentListMsg
   | AgentRunMsg
   | AgentStatusMsg

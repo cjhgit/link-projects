@@ -52,6 +52,7 @@ nonisolated enum FileReply {
     case listing(path: String, entries: [FileEntryInfo])
     case content(String)
     case ack(ok: Bool, error: String?) // 写入回执
+    case chunk(data: Data, done: Bool, size: Int64) // 下载分块（done 为最后一条）
     case failure(String)
 }
 
@@ -94,6 +95,7 @@ nonisolated enum IncomingMessage {
     case execExit(reqId: String, code: Int?, targetId: String)
     case fileContent(reqId: String, content: String?, error: String?, targetId: String)
     case fileListing(reqId: String, path: String, entries: [FileEntryInfo]?, error: String?, targetId: String)
+    case fileDownloadData(reqId: String, offset: Int64, data: String, done: Bool, size: Int64, targetId: String)
     case done(reqId: String, ok: Bool, error: String?, targetId: String)
     case error(reqId: String?, message: String)
     case agentSessions(reqId: String, targetId: String, sessions: [AgentSessionInfo])
@@ -168,6 +170,15 @@ nonisolated enum IncomingMessage {
                 error: obj["error"] as? String,
                 targetId: obj["targetId"] as? String ?? ""
             )
+        case "file-download-data":
+            return .fileDownloadData(
+                reqId: obj["reqId"] as? String ?? "",
+                offset: Int64(obj["offset"] as? Double ?? 0),
+                data: obj["data"] as? String ?? "",
+                done: obj["done"] as? Bool ?? false,
+                size: Int64(obj["size"] as? Double ?? 0),
+                targetId: obj["targetId"] as? String ?? ""
+            )
         case "done":
             return .done(
                 reqId: obj["reqId"] as? String ?? "",
@@ -229,6 +240,12 @@ nonisolated enum OutgoingMessage {
     static func fileList(reqId: String, targetId: String, path: String) -> String {
         json(["type": "file-list", "reqId": reqId, "targetId": targetId, "path": path])
     }
+
+    // 文件上传（分块 base64）与下载
+    static func fileUploadStart(reqId: String, targetId: String, path: String, size: Int64) -> String { json(["type": "file-upload-start", "reqId": reqId, "targetId": targetId, "path": path, "size": size]) }
+    static func fileUploadChunk(reqId: String, targetId: String, offset: Int64, data: String) -> String { json(["type": "file-upload-chunk", "reqId": reqId, "targetId": targetId, "offset": offset, "data": data]) }
+    static func fileUploadFinish(reqId: String, targetId: String) -> String { json(["type": "file-upload-finish", "reqId": reqId, "targetId": targetId]) }
+    static func fileDownload(reqId: String, targetId: String, path: String) -> String { json(["type": "file-download", "reqId": reqId, "targetId": targetId, "path": path]) }
 
     static func agentList(reqId: String, targetId: String) -> String { json(["type": "agent-list", "reqId": reqId, "targetId": targetId]) }
     static func agentRun(reqId: String, targetId: String, prompt: String, sessionId: String?, cwd: String?) -> String { var value: [String: Any] = ["type": "agent-run", "reqId": reqId, "targetId": targetId, "prompt": prompt]; if let sessionId { value["sessionId"] = sessionId }; if let cwd, !cwd.isEmpty { value["cwd"] = cwd }; return json(value) }

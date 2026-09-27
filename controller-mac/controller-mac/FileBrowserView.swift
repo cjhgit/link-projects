@@ -109,6 +109,10 @@ struct FileBrowserView: View {
         VStack(spacing: 0) {
             navBar
             Divider()
+            if let transfer = session.transfer {
+                transferBar(transfer)
+                Divider()
+            }
             if let errorMessage {
                 Text(errorMessage)
                     .font(.callout)
@@ -213,6 +217,12 @@ struct FileBrowserView: View {
             .disabled(path.isEmpty || loading)
             .help("新建文本文件")
 
+            Button(action: pickAndUpload) {
+                Image(systemName: "icloud.and.arrow.up")
+            }
+            .disabled(path.isEmpty || loading || session.transfer != nil || isServerTarget)
+            .help(isServerTarget ? "上传仅支持云电脑客户端（服务器主机不支持）" : "上传本地文件到当前目录")
+
             Button {
                 if !path.isEmpty { load(path) }
             } label: {
@@ -254,6 +264,8 @@ struct FileBrowserView: View {
                             Button("打开") { navigate((path as NSString).appendingPathComponent(entry.name)) }
                         } else if entry.kind == .file {
                             Button("查看 / 编辑…") { viewer = FileViewerSheet(path: (path as NSString).appendingPathComponent(entry.name)) }
+                            Button("下载到本地…") { downloadToMac(entry) }
+                                .disabled(session.transfer != nil || isServerTarget)
                         }
                         Divider()
                         Button("拷贝路径") { copy((path as NSString).appendingPathComponent(entry.name)) }
@@ -304,6 +316,11 @@ struct FileBrowserView: View {
 
     // MARK: 导航与加载
 
+    // 上传 / 下载仅在云电脑客户端可用（@server 由 server 就地处理，不支持传输消息）
+    private var isServerTarget: Bool {
+        session.currentTarget == LinkSession.serverTargetId
+    }
+
     // 跳转到新目录（记录历史，清空前进栈）
     private func navigate(_ newPath: String) {
         guard !loading else { return }
@@ -330,7 +347,68 @@ struct FileBrowserView: View {
         }
     }
 
-    // MARK: 新建 / 删除
+    // MARK: 新建 / 删除 / 上传 / 下载
+
+    // 进度条：上传 / 下载共用（一次一个传输，进行中禁用新传输）
+    private func transferBar(_ transfer: LinkSession.TransferInfo) -> some View {
+        VStack(spacing: 4) {
+            HStack(spacing: 8) {
+                Image(systemName: transfer.isUpload ? "icloud.and.arrow.up" : "icloud.and.arrow.down")
+                    .foregroundStyle(.secondary)
+                Text("\(transfer.isUpload ? "上传" : "下载") \(transfer.fileName)")
+                    .lineLimit(1)
+                Spacer()
+                Text(transfer.total > 0
+                     ? "\(FileFormat.size(Double(transfer.transferred))) / \(FileFormat.size(Double(transfer.total)))"
+                     : FileFormat.size(Double(transfer.transferred)))
+                    .monospacedDigit()
+                    .foregroundStyle(.secondary)
+            }
+            .font(.caption)
+            if transfer.total > 0 {
+                ProgressView(value: Double(transfer.transferred), total: Double(transfer.total))
+            } else {
+                ProgressView()
+                    .controlSize(.small)
+            }
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 6)
+    }
+
+    // 选本地文件上传到当前目录（同名覆盖）
+    private func pickAndUpload() {
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = true
+        panel.canChooseDirectories = false
+        panel.allowsMultipleSelection = false
+        panel.message = "选择要上传到 \(path) 的文件"
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        let scoped = url.startAccessingSecurityScopedResource()
+        let remote = (path as NSString).appendingPathComponent(url.lastPathComponent)
+        session.uploadFile(localURL: url, remotePath: remote) { error in
+            if scoped { url.stopAccessingSecurityScopedResource() }
+            if let error {
+                errorMessage = "上传 \(url.lastPathComponent) 失败：\(error)"
+            } else {
+                load(path) // 上传完成后刷新目录
+            }
+        }
+    }
+
+    // 下载远程文件到本机（NSSavePanel 选保存位置，同名覆盖）
+    private func downloadToMac(_ entry: FileEntryInfo) {
+        let full = (path as NSString).appendingPathComponent(entry.name)
+        let panel = NSSavePanel()
+        panel.nameFieldStringValue = entry.name
+        panel.message = "保存从 \(path) 下载的文件"
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        session.downloadFile(remotePath: full, localURL: url) { error in
+            if let error {
+                errorMessage = "下载 \(entry.name) 失败：\(error)"
+            }
+        }
+    }
 
     private func createFile(named rawName: String) {
         let name = rawName.trimmingCharacters(in: .whitespacesAndNewlines)

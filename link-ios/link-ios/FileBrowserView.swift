@@ -1,5 +1,6 @@
 import SwiftUI
 import UIKit
+import UniformTypeIdentifiers
 
 // 详情区工作模式：项目 / 终端 / 文件浏览器（对当前选中的客户端）
 enum DetailTab: Hashable {
@@ -31,6 +32,13 @@ struct FileBrowserView: View {
     @State private var entryPendingDelete: FileEntryInfo?
     @State private var showJump = false // 路径跳转弹窗
     @State private var jumpPath = ""
+    @State private var showImporter = false // 系统文件选择器（上传）
+    @State private var shareItem: ShareItem? // 下载完成后弹系统分享（可“存储到文件”）
+
+    struct ShareItem: Identifiable {
+        let url: URL
+        let id = UUID()
+    }
 
     struct FileViewerSheet: Identifiable {
         let path: String
@@ -86,6 +94,11 @@ struct FileBrowserView: View {
 
     private var browser: some View {
         List {
+            if let transfer = session.transfer {
+                Section {
+                    transferBar(transfer)
+                }
+            }
             if let errorMessage {
                 Section {
                     Text(errorMessage)
@@ -119,6 +132,14 @@ struct FileBrowserView: View {
         }
         .navigationDestination(item: $pushDir) { dir in
             FileBrowserView(session: session, path: dir)
+        }
+        .sheet(item: $shareItem) { item in
+            ShareSheet(items: [item.url])
+        }
+        .fileImporter(isPresented: $showImporter, allowedContentTypes: [.item], allowsMultipleSelection: false) { result in
+            if case .success(let urls) = result, let url = urls.first {
+                uploadFromDevice(url)
+            }
         }
         .sheet(item: $viewer, onDismiss: {
             // 查看器可能保存过文件（大小/时间变化），关闭后刷新当前目录
@@ -172,6 +193,12 @@ struct FileBrowserView: View {
                         Label("新建文本文件", systemImage: "doc.badge.plus")
                     }
                     .disabled(realPath.isEmpty || loading)
+                    Button {
+                        showImporter = true
+                    } label: {
+                        Label("上传文件到当前目录…", systemImage: "icloud.and.arrow.up")
+                    }
+                    .disabled(realPath.isEmpty || loading || session.transfer != nil || isServerTarget)
                     Button {
                         showHidden.toggle()
                     } label: {
@@ -265,6 +292,12 @@ struct FileBrowserView: View {
                 } label: {
                     Label("查看 / 编辑…", systemImage: "doc.text")
                 }
+                Button {
+                    downloadToDevice(entry)
+                } label: {
+                    Label("下载…", systemImage: "icloud.and.arrow.down")
+                }
+                .disabled(session.transfer != nil || isServerTarget)
             }
             Divider()
             Button {
@@ -282,7 +315,64 @@ struct FileBrowserView: View {
         }
     }
 
-    // MARK: 加载 / 新建 / 删除
+    // MARK: 加载 / 新建 / 删除 / 上传 / 下载
+
+    // 上传 / 下载仅在云电脑客户端可用（@server 由 server 就地处理，不支持传输消息）
+    private var isServerTarget: Bool {
+        session.currentTarget == LinkSession.serverTargetId
+    }
+
+    // 进度条：上传 / 下载共用（一次一个传输，进行中禁用新传输）
+    private func transferBar(_ transfer: LinkSession.TransferInfo) -> some View {
+        VStack(spacing: 6) {
+            HStack(spacing: 8) {
+                Image(systemName: transfer.isUpload ? "icloud.and.arrow.up" : "icloud.and.arrow.down")
+                    .foregroundStyle(.secondary)
+                Text("\(transfer.isUpload ? "上传" : "下载") \(transfer.fileName)")
+                    .lineLimit(1)
+                Spacer()
+                Text(transfer.total > 0
+                     ? "\(FileFormat.size(Double(transfer.transferred))) / \(FileFormat.size(Double(transfer.total)))"
+                     : FileFormat.size(Double(transfer.transferred)))
+                    .monospacedDigit()
+                    .foregroundStyle(.secondary)
+            }
+            .font(.footnote)
+            if transfer.total > 0 {
+                ProgressView(value: Double(transfer.transferred), total: Double(transfer.total))
+            } else {
+                ProgressView()
+                    .controlSize(.small)
+            }
+        }
+    }
+
+    // 从系统文件选择器上传到当前目录（同名覆盖）
+    private func uploadFromDevice(_ url: URL) {
+        let scoped = url.startAccessingSecurityScopedResource()
+        let remote = (realPath as NSString).appendingPathComponent(url.lastPathComponent)
+        session.uploadFile(localURL: url, remotePath: remote) { error in
+            if scoped { url.stopAccessingSecurityScopedResource() }
+            if let error {
+                errorMessage = "上传 \(url.lastPathComponent) 失败：\(error)"
+            } else {
+                load(realPath) // 上传完成后刷新目录
+            }
+        }
+    }
+
+    // 下载到 App 临时目录，完成后弹系统分享（可“存储到文件”或发给其他应用）
+    private func downloadToDevice(_ entry: FileEntryInfo) {
+        let full = (realPath as NSString).appendingPathComponent(entry.name)
+        let localURL = FileManager.default.temporaryDirectory.appendingPathComponent(entry.name)
+        session.downloadFile(remotePath: full, localURL: localURL) { error in
+            if let error {
+                errorMessage = "下载 \(entry.name) 失败：\(error)"
+            } else {
+                shareItem = ShareItem(url: localURL)
+            }
+        }
+    }
 
     private func load(_ newPath: String) {
         loading = true
@@ -550,6 +640,18 @@ struct FileViewerView: View {
         if text.count > 1_000_000 { return "文件超过 1M 字符" }
         return nil
     }
+}
+
+// MARK: - 系统分享（下载完成后导出：存储到“文件”、AirDrop、发给其他应用）
+
+struct ShareSheet: UIViewControllerRepresentable {
+    let items: [Any]
+
+    func makeUIViewController(context: Context) -> UIActivityViewController {
+        UIActivityViewController(activityItems: items, applicationActivities: nil)
+    }
+
+    func updateUIViewController(_ controller: UIActivityViewController, context: Context) {}
 }
 
 // MARK: - 文件信息格式化

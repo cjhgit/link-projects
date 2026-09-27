@@ -12,6 +12,7 @@ import {
   openSync,
   closeSync,
   writeSync,
+  readSync,
 } from 'node:fs';
 import { dirname, join } from 'node:path';
 import type {
@@ -23,6 +24,10 @@ import type {
   FileListMsg,
   FileReadMsg,
   FileWriteMsg,
+  FileUploadStartMsg,
+  FileUploadChunkMsg,
+  FileUploadFinishMsg,
+  FileDownloadMsg,
   AgentListMsg,
   AgentRunMsg,
   AgentStatusMsg,
@@ -259,6 +264,11 @@ async function restartDaemon(): Promise<void> {
 const RECONNECT_DELAY = 3000;
 let ws: WebSocket;
 const runningChildren = new Set<ChildProcess>();
+// 进行中的上传：reqId -> 临时文件句柄（断线时统一清理，避免残留半截文件）
+const uploadTemp = new Map<string, { fd: number; tmpPath: string; finalPath: string; size: number; error?: string }>();
+// 上传 / 下载分块大小（base64 后约 700KB，兼顾消息体积与条数）
+const TRANSFER_CHUNK = 512 * 1024;
+const MAX_DOWNLOAD_SIZE = 1024 * 1024 * 1024; // 超过 1GB 拒绝下载
 
 function reply(msg: AnyMsg) {
   if (ws.readyState === WebSocket.OPEN) {
@@ -271,6 +281,7 @@ function shutdown(code: number): void {
   for (const child of runningChildren) {
     try { child.kill(); } catch { /* 忽略 */ }
   }
+  cleanupUploads();
   // stop / 重启时不让 Claude 子进程脱离 client 继续运行；同步落盘使下次刷新能看见原因。
   if (agentProcesses.size > 0) {
     const now = Date.now();
@@ -336,6 +347,14 @@ function connect() {
         return handleFileDelete(msg as FileDeleteMsg);
       case 'file-list':
         return handleFileList(msg as FileListMsg);
+      case 'file-upload-start':
+        return handleFileUploadStart(msg as FileUploadStartMsg);
+      case 'file-upload-chunk':
+        return handleFileUploadChunk(msg as FileUploadChunkMsg);
+      case 'file-upload-finish':
+        return handleFileUploadFinish(msg as FileUploadFinishMsg);
+      case 'file-download':
+        return handleFileDownload(msg as FileDownloadMsg);
       case 'agent-list':
         return handleAgentList(msg as AgentListMsg);
       case 'agent-run':
@@ -355,6 +374,8 @@ function connect() {
 
   ws.on('close', () => {
     console.log(`[client] 连接断开，${RECONNECT_DELAY / 1000}s 后重连`);
+    // 断线时进行中的上传必然残缺，清掉临时文件（控制端等不到回执也会放弃）
+    cleanupUploads();
     setTimeout(connect, RECONNECT_DELAY);
   });
 
@@ -717,6 +738,104 @@ async function handleFileList(msg: FileListMsg) {
     reply({ type: 'file-listing', reqId: msg.reqId, targetId: msg.targetId, path: target, entries });
   } catch (err: any) {
     reply({ type: 'file-listing', reqId: msg.reqId, targetId: msg.targetId, path: target, error: err.message });
+  }
+}
+
+// ---------- 文件上传 / 下载（分块 base64；上传先写临时文件，收完原子替换） ----------
+
+// 清理进行中的上传（断线 / 退出时调用）：关句柄、删半截临时文件
+function cleanupUploads(): void {
+  for (const entry of uploadTemp.values()) {
+    try { closeSync(entry.fd); } catch { /* 已关闭 */ }
+    try { unlinkSync(entry.tmpPath); } catch { /* 忽略 */ }
+  }
+  uploadTemp.clear();
+}
+
+// 展开路径开头的 ~（上传 / 下载共用）
+function expandPath(raw: string): string {
+  return raw === '~' || raw.startsWith('~/') ? join(homedir(), raw.slice(1)) : raw;
+}
+
+function handleFileUploadStart(msg: FileUploadStartMsg) {
+  console.log(`[file-upload] ${msg.path} (${msg.size} 字节)`);
+  const finalPath = expandPath(msg.path);
+  const tmpPath = `${finalPath}.link-upload-${msg.reqId}.tmp`;
+  try {
+    // 必须同步完成注册：紧随其后的 chunk / finish（空文件时 finish 直接到达）
+    // 依赖本条消息处理完时 uploadTemp 已有条目，不能让出事件循环。
+    // 目标目录不存在时创建（与 file-write 行为一致）；临时文件放同目录，rename 原子生效
+    mkdirSync(dirname(finalPath), { recursive: true });
+    const fd = openSync(tmpPath, 'w');
+    uploadTemp.set(msg.reqId, { fd, tmpPath, finalPath, size: msg.size });
+  } catch (err: any) {
+    reply({ type: 'done', reqId: msg.reqId, targetId: msg.targetId, ok: false, error: `创建上传临时文件失败: ${err.message}` });
+  }
+}
+
+function handleFileUploadChunk(msg: FileUploadChunkMsg) {
+  const entry = uploadTemp.get(msg.reqId);
+  if (!entry) return; // start 失败后的迟到数据块，直接忽略（finish 会回执失败）
+  if (entry.error) return; // 已失败，等 finish 回执
+  try {
+    const buf = Buffer.from(msg.data, 'base64');
+    writeSync(entry.fd, buf, 0, buf.length, msg.offset);
+  } catch (err: any) {
+    entry.error = `写入上传数据失败: ${err.message}`;
+  }
+}
+
+async function handleFileUploadFinish(msg: FileUploadFinishMsg) {
+  const entry = uploadTemp.get(msg.reqId);
+  if (!entry) {
+    return reply({ type: 'done', reqId: msg.reqId, targetId: msg.targetId, ok: false, error: '上传已中断（未开始或连接已重置）' });
+  }
+  uploadTemp.delete(msg.reqId);
+  try { closeSync(entry.fd); } catch { /* 忽略 */ }
+  try {
+    // 大小校验：防止控制端中途丢块产生截断文件
+    const actual = (await stat(entry.tmpPath)).size;
+    if (actual !== entry.size) {
+      throw new Error(`大小不匹配（收到 ${actual} / 声明 ${entry.size} 字节）`);
+    }
+    if (entry.error) throw new Error(entry.error);
+    await rename(entry.tmpPath, entry.finalPath);
+    console.log(`[file-upload] 完成 ${entry.finalPath}`);
+    reply({ type: 'done', reqId: msg.reqId, targetId: msg.targetId, ok: true });
+  } catch (err: any) {
+    try { await rm(entry.tmpPath, { force: true }); } catch { /* 忽略 */ }
+    reply({ type: 'done', reqId: msg.reqId, targetId: msg.targetId, ok: false, error: `上传失败: ${err.message}` });
+  }
+}
+
+async function handleFileDownload(msg: FileDownloadMsg) {
+  const target = expandPath(msg.path);
+  let fd: number | undefined;
+  try {
+    const st = await stat(target);
+    if (!st.isFile()) throw new Error('不是普通文件（目录 / 设备等），无法下载');
+    if (st.size > MAX_DOWNLOAD_SIZE) throw new Error(`文件超过 1GB（${st.size} 字节），暂不支持下载`);
+    console.log(`[file-download] ${msg.path} -> ${target} (${st.size} 字节)`);
+    fd = openSync(target, 'r');
+    const buf = Buffer.alloc(TRANSFER_CHUNK);
+    let offset = 0;
+    for (;;) {
+      const n = st.size === 0 ? 0 : readSync(fd, buf, 0, TRANSFER_CHUNK, offset);
+      const done = offset + n >= st.size;
+      const payload = JSON.stringify({
+        type: 'file-download-data', reqId: msg.reqId, targetId: msg.targetId,
+        offset, data: buf.subarray(0, n).toString('base64'), done, size: st.size,
+      });
+      // 逐块等发送完成再读下一块，避免大文件整体堆在发送缓冲里
+      await new Promise<void>((resolve) => ws.send(payload, () => resolve()));
+      if (done) break;
+      offset += n;
+    }
+    console.log(`[file-download] 完成 ${target}`);
+  } catch (err: any) {
+    reply({ type: 'error', reqId: msg.reqId, message: `下载失败: ${err.message}` });
+  } finally {
+    if (fd !== undefined) { try { closeSync(fd); } catch { /* 忽略 */ } }
   }
 }
 
