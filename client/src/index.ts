@@ -33,6 +33,7 @@ import type {
   AgentStatusMsg,
   AgentDeleteMsg,
   AgentSession,
+  AgentKind,
   ProjectListMsg,
   ProjectSaveMsg,
   ProjectDeleteMsg,
@@ -76,7 +77,8 @@ const VERSION: string = JSON.parse(readFileSync(join(__dirname, '..', 'package.j
 const RUNTIME_DIR = join(homedir(), '.link-projects');
 const PID_FILE = join(RUNTIME_DIR, 'client.pid');
 const LOG_FILE = join(RUNTIME_DIR, 'client.log');
-// Claude Code 的会话摘要与对话记录属于云电脑，不经过 controller / server 存储。
+// Agent（Claude Code / Codex CLI）的会话摘要与对话记录属于云电脑，不经过 controller / server 存储。
+// 文件名沿用 claude-sessions.json（历史遗留），claude 与 codex 会话混存于同一个文件。
 const AGENT_SESSIONS_FILE = join(RUNTIME_DIR, 'claude-sessions.json');
 const DEFAULT_AGENT_CWD = join(RUNTIME_DIR, 'workspace');
 const agentProcesses = new Map<string, ChildProcess>();
@@ -396,12 +398,16 @@ function connect() {
   });
 }
 
-// ---------- Claude Code 会话 ----------
+// ---------- Agent 会话（Claude Code / Codex CLI） ----------
 
 async function loadAgentSessions(): Promise<void> {
   try {
     const parsed = JSON.parse(await readFile(AGENT_SESSIONS_FILE, 'utf8'));
     agentSessions = Array.isArray(parsed) ? parsed : [];
+    // 旧记录没有 agent 字段，统一规范化为 claude，后续逻辑不必再判空
+    for (const session of agentSessions) {
+      if (session.agent !== 'codex') session.agent = 'claude';
+    }
     // client 重启意味着旧 CLI 子进程不可能仍由本实例托管，避免永久显示“运行中”。
     let changed = false;
     for (const session of agentSessions) {
@@ -468,7 +474,7 @@ function handleAgentRun(msg: AgentRunMsg) {
   let session: AgentSession | undefined;
   if (msg.sessionId) session = agentSessions.find((item) => item.sessionId === msg.sessionId);
   if (msg.sessionId && !session) {
-    return reply({ type: 'error', reqId: msg.reqId, message: '找不到该 Claude 会话（它可能已在云电脑上被删除）' });
+    return reply({ type: 'error', reqId: msg.reqId, message: '找不到该会话（它可能已在云电脑上被删除）' });
   }
   if (session && session.state === 'running') {
     return reply({ type: 'error', reqId: msg.reqId, message: '该会话仍在执行中，请稍后刷新状态' });
@@ -480,12 +486,14 @@ function handleAgentRun(msg: AgentRunMsg) {
     const cwd = requestedCwd
       ? (requestedCwd === '~' || requestedCwd.startsWith('~/') ? join(homedir(), requestedCwd.slice(1)) : requestedCwd)
       : DEFAULT_AGENT_CWD;
-    // 默认工作区以及用户明确指定的不存在目录都会创建，避免 Claude 因 cwd 不存在直接启动失败。
+    // 默认工作区以及用户明确指定的不存在目录都会创建，避免 CLI 因 cwd 不存在直接启动失败。
     try { mkdirSync(cwd, { recursive: true }); } catch (err: any) {
       return reply({ type: 'error', reqId: msg.reqId, message: `无法创建 Agent 工作目录 ${cwd}: ${err.message}` });
     }
     session = {
       sessionId: randomUUID(),
+      // 新建时才采用 msg.agent（缺省 claude）；继续会话时类型以记录为准
+      agent: msg.agent === 'codex' ? 'codex' : 'claude',
       title: prompt.replace(/\s+/g, ' ').slice(0, 48),
       cwd,
       state: 'running',
@@ -505,19 +513,33 @@ function handleAgentRun(msg: AgentRunMsg) {
   // 立即回 running 快照；网络中断时控制端可稍后用 agent-status / agent-list 拉取最终结果。
   replyAgent(msg.reqId, msg.targetId, [session]);
 
-  // 云电脑 Agent 没有可供用户确认的本地交互界面；显式跳过 Claude Code 的逐次权限询问，
+  // 云电脑 Agent 没有可供用户确认的本地交互界面；显式跳过 CLI 的逐次权限询问，
   // 使其能按用户在控制端发起的任务读取和修改工作目录中的文件。
-  // include-partial-messages 才会在 stream-json 中输出 token 级 text_delta；否则通常只会收到结束结果。
-  const args = ['-p', prompt, '--output-format', 'stream-json', '--verbose', '--include-partial-messages', '--dangerously-skip-permissions'];
-  if (msg.sessionId) args.push('--resume', session.sessionId);
-  else args.push('--session-id', session.sessionId);
-  console.log(`[agent] ${msg.sessionId ? '继续' : '新建'}会话 ${session.sessionId}${session.cwd ? ` (cwd: ${session.cwd})` : ''}`);
-  const child = spawn('claude', args, { cwd: session.cwd || undefined, env: process.env });
+  const kind: AgentKind = session.agent ?? 'claude';
+  let file: string;
+  let args: string[];
+  if (kind === 'codex') {
+    // codex exec --json 输出 JSONL 事件；thread id 由 codex 自行生成（无法预指定），
+    // 继续会话靠 exec resume <externalId>。stdin 必须给 /dev/null：管道会让 codex 追加读取 stdin 而挂起。
+    file = 'codex';
+    args = ['exec', '--json', '--skip-git-repo-check', '--dangerously-bypass-approvals-and-sandbox'];
+    if (msg.sessionId && session.externalId) args.push('resume', session.externalId);
+    args.push(prompt);
+  } else {
+    // include-partial-messages 才会在 stream-json 中输出 token 级 text_delta；否则通常只会收到结束结果。
+    file = 'claude';
+    args = ['-p', prompt, '--output-format', 'stream-json', '--verbose', '--include-partial-messages', '--dangerously-skip-permissions'];
+    if (msg.sessionId) args.push('--resume', session.sessionId);
+    else args.push('--session-id', session.sessionId);
+  }
+  console.log(`[agent] ${msg.sessionId ? '继续' : '新建'}${kind === 'codex' ? ' Codex' : ' Claude Code'} 会话 ${session.sessionId}${session.cwd ? ` (cwd: ${session.cwd})` : ''}`);
+  const child = spawn(file, args, { cwd: session.cwd || undefined, env: process.env, stdio: ['ignore', 'pipe', 'pipe'] });
   agentProcesses.set(session.sessionId, child);
   let stdout = '';
   let stderr = '';
   let streamBuffer = '';
   let streamedText = '';
+  let turnCompleted = false; // codex：收到过 turn.completed 则视为执行成功（stderr 可能有无害杂音）
   let assistantMessage: AgentSession['messages'][number] | undefined;
   const publishStream = () => {
     session!.updatedAt = Date.now();
@@ -529,6 +551,27 @@ function handleAgentRun(msg: AgentRunMsg) {
     if (!line.trim()) return;
     try {
       const event = JSON.parse(line);
+      if (kind === 'codex') {
+        if (event?.type === 'thread.started' && typeof event.thread_id === 'string') {
+          // resume 与新建都会下发 thread.started；尽早落盘，client 中途被杀后仍可恢复
+          if (session!.externalId !== event.thread_id) {
+            session!.externalId = event.thread_id;
+            session!.updatedAt = Date.now();
+            persistAgentSessions().catch((err) => console.error(`[agent] 保存会话失败: ${err.message}`));
+          }
+        } else if (event?.type === 'item.completed' && event?.item?.type === 'agent_message') {
+          const text = typeof event?.item?.text === 'string' ? event.item.text : '';
+          if (text) {
+            // codex 的 item.completed 携带整条消息（无 token 级增量），一次成条
+            session!.messages.push({ role: 'assistant', content: text, createdAt: Date.now() });
+            streamedText += text;
+            publishStream();
+          }
+        } else if (event?.type === 'turn.completed') {
+          turnCompleted = true;
+        }
+        return;
+      }
       const delta = event?.event?.delta;
       const text = delta?.type === 'text_delta' ? delta.text : undefined;
       if (typeof text === 'string' && text) {
@@ -552,30 +595,37 @@ function handleAgentRun(msg: AgentRunMsg) {
   });
   child.stderr.on('data', (data) => { stderr += data.toString(); });
   child.on('error', async (err) => {
-    if (err.message.includes('ENOENT')) stderr += '未找到 claude 命令，请确认云电脑已安装 Claude Code CLI 且已登录。';
+    if (err.message.includes('ENOENT')) {
+      stderr += kind === 'codex'
+        ? '未找到 codex 命令，请确认云电脑已安装 Codex CLI 且已登录。'
+        : '未找到 claude 命令，请确认云电脑已安装 Claude Code CLI 且已登录。';
+    }
   });
   child.on('close', async (code) => {
     agentProcesses.delete(session!.sessionId);
     const finished = Date.now();
     if (streamBuffer) consumeStreamLine(streamBuffer);
     let result = '';
-    // stream-json 的最终 result 事件带完整结果；仅在未收到文本增量时作为回退，避免重复展示。
-    for (const line of stdout.split(/\r?\n/)) {
-      try {
-        const event = JSON.parse(line);
-        if (event.type === 'result') {
-          if (event.is_error) stderr ||= typeof event.result === 'string' ? event.result : 'Claude Code 执行失败';
-          if (typeof event.result === 'string') result = event.result;
-        }
-      } catch { /* 忽略非 JSON 行 */ }
+    // claude stream-json 的最终 result 事件带完整结果；仅在未收到文本增量时作为回退，避免重复展示。
+    if (kind !== 'codex') {
+      for (const line of stdout.split(/\r?\n/)) {
+        try {
+          const event = JSON.parse(line);
+          if (event.type === 'result') {
+            if (event.is_error) stderr ||= typeof event.result === 'string' ? event.result : 'Claude Code 执行失败';
+            if (typeof event.result === 'string') result = event.result;
+          }
+        } catch { /* 忽略非 JSON 行 */ }
+      }
     }
     if (!streamedText && result) session!.messages.push({ role: 'assistant', content: result, createdAt: finished });
     session!.updatedAt = finished;
-    if (code === 0 && !stderr) {
+    // codex 的 stderr 可能带无害运行提示（如工作目录提示），以 turn.completed 为准判成功
+    if (code === 0 && (kind === 'codex' ? turnCompleted || !stderr : !stderr)) {
       session!.state = 'completed';
     } else {
       session!.state = 'failed';
-      session!.error = stderr.trim() || `Claude Code 退出码 ${code ?? '未知'}`;
+      session!.error = stderr.trim() || `${kind === 'codex' ? 'Codex' : 'Claude Code'} 退出码 ${code ?? '未知'}`;
     }
     try { await persistAgentSessions(); } catch (err: any) { console.error(`[agent] 保存会话失败: ${err.message}`); }
     // 流式阶段已推送 running；退出时必须再推送最终 completed / failed，控制端才能关闭 loading。

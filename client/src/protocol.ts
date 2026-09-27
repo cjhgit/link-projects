@@ -179,8 +179,11 @@ export interface ErrorMsg {
   message: string;
 }
 
-// ===== Claude Code 会话（会话记录只保存在 client 本机） =====
+// ===== Agent 会话（Claude Code / Codex CLI，会话记录只保存在 client 本机） =====
 export type AgentSessionState = 'running' | 'completed' | 'failed';
+
+// 底层 CLI：claude = Claude Code（默认），codex = OpenAI Codex
+export type AgentKind = 'claude' | 'codex';
 
 export interface AgentMessage {
   role: 'user' | 'assistant';
@@ -189,7 +192,9 @@ export interface AgentMessage {
 }
 
 export interface AgentSession {
-  sessionId: string; // 同时作为 Claude Code --session-id / --resume 的 ID
+  sessionId: string; // Link 内部 ID；claude 同时作为 --session-id / --resume 的 ID
+  agent?: AgentKind; // 创建该会话的 CLI；旧记录无此字段视为 claude
+  externalId?: string; // codex 的 thread id（exec resume 用）；claude 不需要
   title: string;
   cwd?: string;
   state: AgentSessionState;
@@ -206,7 +211,8 @@ export interface AgentListMsg {
   targetId: string;
 }
 
-// 新建会话（不传 sessionId）或在既有 Claude 会话中继续对话（传 sessionId）
+// 新建会话（不传 sessionId）或在既有会话中继续对话（传 sessionId）；
+// agent 仅在新建时生效（缺省 claude），继续会话时以会话记录保存的类型为准
 export interface AgentRunMsg {
   type: 'agent-run';
   reqId: string;
@@ -214,6 +220,7 @@ export interface AgentRunMsg {
   prompt: string;
   sessionId?: string;
   cwd?: string;
+  agent?: AgentKind;
 }
 
 // 刷新单个会话的状态及完整消息记录

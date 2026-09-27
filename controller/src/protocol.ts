@@ -179,12 +179,13 @@ export interface ErrorMsg {
   message: string;
 }
 
-// ===== Claude Code 会话（会话记录只保存在 client 本机） =====
+// ===== Agent 会话（Claude Code / Codex CLI，会话记录只保存在 client 本机） =====
 export type AgentSessionState = 'running' | 'completed' | 'failed';
+export type AgentKind = 'claude' | 'codex'; // 底层 CLI：claude = Claude Code（默认），codex = OpenAI Codex
 export interface AgentMessage { role: 'user' | 'assistant'; content: string; createdAt: number; }
-export interface AgentSession { sessionId: string; title: string; cwd?: string; state: AgentSessionState; createdAt: number; updatedAt: number; error?: string; messages: AgentMessage[]; }
+export interface AgentSession { sessionId: string; agent?: AgentKind; externalId?: string; title: string; cwd?: string; state: AgentSessionState; createdAt: number; updatedAt: number; error?: string; messages: AgentMessage[]; }
 export interface AgentListMsg { type: 'agent-list'; reqId: string; targetId: string; }
-export interface AgentRunMsg { type: 'agent-run'; reqId: string; targetId: string; prompt: string; sessionId?: string; cwd?: string; }
+export interface AgentRunMsg { type: 'agent-run'; reqId: string; targetId: string; prompt: string; sessionId?: string; cwd?: string; agent?: AgentKind; }
 export interface AgentStatusMsg { type: 'agent-status'; reqId: string; targetId: string; sessionId: string; }
 export interface AgentDeleteMsg { type: 'agent-delete'; reqId: string; targetId: string; sessionId: string; }
 export interface AgentSessionsMsg { type: 'agent-sessions'; reqId: string; targetId: string; sessions: AgentSession[]; }

@@ -62,11 +62,19 @@ nonisolated enum FileOutcome<Value> {
     case failed(String)
 }
 
-// Claude Code 会话快照；真实持久化文件仅位于云电脑 client 的 ~/.link-projects/claude-sessions.json。
+// Agent 会话快照（Claude Code / Codex CLI）；真实持久化文件仅位于云电脑 client 的 ~/.link-projects/claude-sessions.json。
 nonisolated enum AgentSessionState: String, Equatable {
     case running
     case completed
     case failed
+}
+
+// 底层 CLI：claude = Claude Code（默认，旧记录无 agent 字段也视为它），codex = OpenAI Codex
+nonisolated enum AgentKind: String, Equatable {
+    case claude
+    case codex
+
+    var displayName: String { self == .codex ? "Codex" : "Claude Code" }
 }
 
 nonisolated struct AgentMessageInfo: Identifiable, Equatable {
@@ -78,6 +86,7 @@ nonisolated struct AgentMessageInfo: Identifiable, Equatable {
 
 nonisolated struct AgentSessionInfo: Identifiable, Equatable {
     let sessionId: String
+    let agent: AgentKind // 创建该会话的 CLI；旧记录无 agent 字段解析为 claude
     let title: String
     let cwd: String?
     let state: AgentSessionState
@@ -243,6 +252,7 @@ nonisolated enum IncomingMessage {
             let sessions = (obj["sessions"] as? [[String: Any]] ?? []).map { item in
                 AgentSessionInfo(
                     sessionId: item["sessionId"] as? String ?? "",
+                    agent: AgentKind(rawValue: item["agent"] as? String ?? "") ?? .claude,
                     title: item["title"] as? String ?? "未命名会话",
                     cwd: item["cwd"] as? String,
                     state: AgentSessionState(rawValue: item["state"] as? String ?? "") ?? .failed,
@@ -316,10 +326,12 @@ nonisolated enum OutgoingMessage {
         json(["type": "agent-list", "reqId": reqId, "targetId": targetId])
     }
 
-    static func agentRun(reqId: String, targetId: String, prompt: String, sessionId: String?, cwd: String?) -> String {
+    // agent 仅新建会话时传（继续会话时 client 以会话记录保存的类型为准）
+    static func agentRun(reqId: String, targetId: String, prompt: String, sessionId: String?, cwd: String?, agent: AgentKind? = nil) -> String {
         var value: [String: Any] = ["type": "agent-run", "reqId": reqId, "targetId": targetId, "prompt": prompt]
         if let sessionId { value["sessionId"] = sessionId }
         if let cwd, !cwd.isEmpty { value["cwd"] = cwd }
+        if let agent { value["agent"] = agent.rawValue }
         return json(value)
     }
 

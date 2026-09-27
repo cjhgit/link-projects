@@ -1,6 +1,7 @@
 import SwiftUI
+import AppKit
 
-// Claude Code 的轻量会话前端：这里只保存当前界面状态，记录与任务状态都由云电脑 client 保存。
+// Agent（Claude Code / Codex CLI）的轻量会话前端：这里只保存当前界面状态，记录与任务状态都由云电脑 client 保存。
 struct AgentView: View {
     let session: LinkSession
     var initialCwd: String? = nil // 项目页「新建会话」跳转时预填的工作目录
@@ -8,7 +9,9 @@ struct AgentView: View {
     @State private var selectedId: String?
     @State private var prompt = ""
     @State private var cwd = ""
+    @State private var agentKind: AgentKind = .claude // 新建会话使用的 CLI，默认 Claude Code
     @State private var loading = false
+    @State private var copiedId = false // session id 复制成功后的短暂反馈
     @State private var sending = false
     @State private var confirmDelete = false
 
@@ -26,7 +29,12 @@ struct AgentView: View {
                 List(selection: $selectedId) {
                     ForEach(sessions) { item in
                         VStack(alignment: .leading, spacing: 3) {
-                            HStack { Text(item.title).lineLimit(1); Spacer(); stateIcon(item.state) }
+                            HStack {
+                                Text(item.title).lineLimit(1)
+                                Spacer()
+                                Text(item.agent == .codex ? "Codex" : "Claude").font(.caption2).foregroundStyle(.secondary).padding(.horizontal, 5).padding(.vertical, 1).background(Color.secondary.opacity(0.15)).clipShape(Capsule())
+                                stateIcon(item.state)
+                            }
                             Text(item.cwd ?? "默认目录").font(.caption).foregroundStyle(.secondary).lineLimit(1)
                         }.tag(item.id)
                     }
@@ -42,14 +50,14 @@ struct AgentView: View {
             .toolbar {
                 Button { selectedId = nil; prompt = "" } label: { Image(systemName: "square.and.pencil") }.help("新建会话")
                 Button { confirmDelete = true } label: { Image(systemName: "trash") }
-                    .help("删除 Link 会话记录（不会删除 Claude 会话）")
+                    .help("删除 Link 会话记录（不会删除 CLI 自己的会话）")
                     .disabled(selected == nil || selected?.state == .running)
                 Button { refresh(targetId) } label: { Image(systemName: "arrow.clockwise") }.help("刷新会话状态和输出").disabled(loading)
             }
             .confirmationDialog("删除 Link 会话记录", isPresented: $confirmDelete) {
-                Button("删除（不会删除 Claude 会话）", role: .destructive) { deleteSelected(targetId) }
+                Button("删除（不会删除 CLI 自己的会话）", role: .destructive) { deleteSelected(targetId) }
                 Button("取消", role: .cancel) {}
-            } message: { Text("只会删除本应用在云电脑保存的会话记录，Claude Code 的原生会话不会受影响。") }
+            } message: { Text("只会删除本应用在云电脑保存的会话记录，Claude Code / Codex 的原生会话不会受影响。") }
             .onAppear {
                 session.observeAgentUpdates(targetId: targetId) { applyUpdates($0) }
                 refresh(targetId)
@@ -64,28 +72,49 @@ struct AgentView: View {
         }
     }
 
+    // 会话 ID：点击复制到剪贴板（claude 会话即 CLI 的 --resume ID）
+    private func sessionIdRow(_ item: AgentSessionInfo) -> some View {
+        HStack(spacing: 4) {
+            Image(systemName: copiedId ? "checkmark" : "doc.on.doc").font(.caption2)
+            Text(copiedId ? "已复制" : item.sessionId)
+                .font(.system(.caption2, design: .monospaced))
+                .lineLimit(1)
+                .truncationMode(.middle)
+        }
+        .foregroundStyle(.secondary)
+        .contentShape(Rectangle())
+        .onTapGesture {
+            NSPasteboard.general.clearContents()
+            NSPasteboard.general.setString(item.sessionId, forType: .string)
+            copiedId = true
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) { copiedId = false }
+        }
+        .help("点击复制 Session ID")
+    }
+
     private var conversation: some View {
         ScrollViewReader { proxy in
             ScrollView {
                 VStack(alignment: .leading, spacing: 12) {
                     if let selected {
                         HStack { Text(selected.title).font(.headline); Spacer(); stateLabel(selected.state) }
+                        sessionIdRow(selected)
                         if isResponding {
                             HStack(spacing: 8) {
                                 ProgressView().controlSize(.small)
-                                Text("Claude Code 正在响应…")
+                                Text("\(selected.agent.displayName) 正在响应…")
                             }
                             .font(.callout).foregroundStyle(.secondary)
                         }
                         if let error = selected.error { Text(error).foregroundStyle(.red).font(.callout) }
                         ForEach(selected.messages) { message in
                             VStack(alignment: .leading, spacing: 4) {
-                                Text(message.role == "user" ? "你" : "Claude Code").font(.caption).foregroundStyle(.secondary)
+                                Text(message.role == "user" ? "你" : selected.agent.displayName).font(.caption).foregroundStyle(.secondary)
                                 Text(message.content).textSelection(.enabled).frame(maxWidth: .infinity, alignment: .leading)
                             }.padding(10).background(message.role == "user" ? Color.accentColor.opacity(0.12) : Color.secondary.opacity(0.10)).clipShape(RoundedRectangle(cornerRadius: 8)).id(message.id)
                         }
                     } else {
-                        ContentUnavailableView("新建 Claude Code 会话", systemImage: "sparkles", description: Text("输入任务后会在所选云电脑运行；可随时刷新查看完成状态。"))
+                        ContentUnavailableView("新建 Agent 会话", systemImage: "sparkles", description: Text("选择 Claude Code 或 Codex，输入任务后会在所选云电脑运行；可随时刷新查看完成状态。"))
                     }
                 }.padding(14)
             }
@@ -95,9 +124,17 @@ struct AgentView: View {
 
     private func composer(targetId: String) -> some View {
         VStack(spacing: 7) {
-            if selectedId == nil { TextField("工作目录（可选）", text: $cwd).textFieldStyle(.roundedBorder) }
+            if selectedId == nil {
+                HStack(spacing: 8) {
+                    TextField("工作目录（可选）", text: $cwd).textFieldStyle(.roundedBorder)
+                    Picker("CLI", selection: $agentKind) {
+                        Text("Claude Code").tag(AgentKind.claude)
+                        Text("Codex").tag(AgentKind.codex)
+                    }.pickerStyle(.menu).labelsHidden().fixedSize().help("新建会话使用的命令行工具；Claude Code 为默认。")
+                }
+            }
             HStack(alignment: .bottom) {
-                TextField(selectedId == nil ? "告诉 Claude Code 要做什么" : "继续这个会话", text: $prompt, axis: .vertical)
+                TextField(selectedId == nil ? "告诉 \(agentKind.displayName) 要做什么" : "继续这个会话", text: $prompt, axis: .vertical)
                     .lineLimit(1...5).textFieldStyle(.roundedBorder)
                     .onSubmit { run(targetId) }
                 Button("发送") { run(targetId) }.disabled(prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || isResponding)
@@ -131,7 +168,8 @@ struct AgentView: View {
     private func run(_ targetId: String) {
         let text = prompt.trimmingCharacters(in: .whitespacesAndNewlines); guard !text.isEmpty else { return }
         sending = true
-        session.runAgent(targetId: targetId, prompt: text, sessionId: selectedId, cwd: selectedId == nil ? cwd : nil) { result in
+        // agent 只在新建时传；继续会话由 client 按会话记录的类型调用对应 CLI
+        session.runAgent(targetId: targetId, prompt: text, sessionId: selectedId, cwd: selectedId == nil ? cwd : nil, agent: selectedId == nil ? agentKind : nil) { result in
             sending = false; prompt = ""; if let item = result.first { upsert(item); selectedId = item.id }
         }
     }
