@@ -3,6 +3,7 @@ import SwiftUI
 // 会话记录由云电脑 client 持久化；默认先展示会话列表，+ 才进入新建流程。
 struct AgentView: View {
     let session: LinkSession
+    var initialCwd: String? = nil // 项目页「新建会话」跳转时预填的工作目录
     @State private var sessions: [AgentSessionInfo] = []
     @State private var selectedId: String?
     @State private var creating = false
@@ -36,7 +37,10 @@ struct AgentView: View {
             }
             .onAppear { refresh(targetId) }
             .onAppear { session.observeAgentUpdates(targetId: targetId) { applyUpdates($0) } }
+            .onAppear { prepareNewSession() }
             .onDisappear { session.stopObservingAgentUpdates(targetId: targetId) }
+            // 项目页再次发起「新建会话」时更新预填目录
+            .onChange(of: initialCwd) { _, _ in prepareNewSession() }
             .confirmationDialog("删除 Link 会话记录", isPresented: $confirmDelete) {
                 Button("删除（不会删除 Claude 会话）", role: .destructive) {
                     if let item = deleteCandidate { deleteSelected(targetId, item: item) }
@@ -156,6 +160,15 @@ struct AgentView: View {
                 Text("云电脑仍在执行，可稍后刷新查看结果。").font(.caption).foregroundStyle(.secondary).frame(maxWidth: .infinity, alignment: .leading)
             }
         }.padding(10)
+    }
+
+    // 项目页发起的「新建会话」：切到新建状态并预填工作目录
+    private func prepareNewSession() {
+        guard let initialCwd, !initialCwd.isEmpty else { return }
+        selectedId = nil
+        creating = true
+        prompt = ""
+        cwd = initialCwd
     }
 
     private func refresh(_ targetId: String) {

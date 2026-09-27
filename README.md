@@ -136,6 +136,7 @@ run       前台运行，调试排查用（Ctrl+C 退出）
 - **可直接操作服务器本机**：客户端列表固定首行「服务器主机」（`@server` 保留目标，`~` 为 server 家目录），选中后终端即可在 server 上执行命令（实时输出），「文件」页签可浏览/查看/编辑/新建/删除 server 上的文件（如直接改 `clients.json`、看日志）；命令与文件浏览分别由 server 的 `ALLOW_SERVER_EXEC` / `ALLOW_SERVER_FILES` 控制
 - 服务端列表存于 UserDefaults；首次启动自动从旧的单服务端配置（`~/.link-projects/controller.env` / 环境变量 / 旧 UserDefaults）迁移
 - 交互命令与上面一致（另含 `/clear` 清屏，无 `/exit`）
+- **项目页签**排在「终端 / 文件 / Agent」最前：项目 = 云电脑上的常用目录，可添加/编辑/删除；行内可一键**打开目录**（跳「文件」页直接定位到该目录）或**新建会话**（跳「Agent」页并预填该目录为工作目录）。项目清单只保存到云电脑 `~/.link-projects/projects.json`（同 Agent 会话的存放方式），中继 server 与控制端不保存。
 - **Agent 页签**与「终端 / 文件」并列：仅针对在线云电脑，调用该机已安装并登录的 `claude`（Claude Code CLI）。可新建会话、选取历史会话继续对话，并通过刷新查看「执行中 / 已完成 / 失败」及最终输出；不依赖实时流式传输。
 - Agent 的会话清单、对话记录和状态只保存到云电脑 `~/.link-projects/claude-sessions.json`，中继 server 与控制端不保存；控制端网络中断后重新连接、选择同一云电脑并刷新即可恢复查看。若云电脑 client 自身重启，之前显示为执行中的任务会标为状态未知，避免误报仍在运行。
 - 命令行运行：`./run.sh`（杀掉旧进程 → xcodebuild 构建 → 后台启动，日志 `/tmp/controller-mac.log`）
@@ -148,13 +149,13 @@ run       前台运行，调试排查用（Ctrl+C 退出）
 - 功能与 controller-mac 一致：多服务端管理（连接/断开/编辑/删除，启动自动连接）、客户端白名单管理（增删改、token 随机生成、拷贝 ID/Token/接入配置）、终端（`/list` `/use` `/read` `/write` `/clear` `/help` + 任意 shell 命令，输出按客户端分流）、远程文件浏览（客户端与服务器本机 `@server`，目录导航/路径跳转/隐藏文件/新建/删除/查看编辑保存，二进制与超大文件只读）
 - 服务端列表存于 UserDefaults（iPhone 沙盒内，不与 mac 版共享）
 - 移动端适配：三栏改为「服务器 → 客户端 → 工作区」push 导航；右键菜单改为长按菜单 + 左滑操作；文件查看器为全屏模态，有未保存修改时禁止下滑关闭；键盘上方提供清屏/收起键盘工具条
-- 工作区提供「Agent」页签，可创建/续聊云电脑本机的 Claude Code 会话，并手动刷新任务状态与结果
+- 工作区提供「项目」页签（管理云电脑常用目录：一键打开目录 / 以项目目录发起 Agent 新会话）与「Agent」页签，可创建/续聊云电脑本机的 Claude Code 会话，并手动刷新任务状态与结果
 - 回到前台自动重连被系统断开的连接（锁屏/切后台后 ws 易被断开）；手动断开或注册被拒则不打扰
 - 部署目标 iOS 26；`Info.plist` 已放开 ATS（自建 ws:// 明文直连；条件允许时建议服务端配 TLS 用 wss:// 接入）
 
 ## 运维备忘
 
-- **更新 server 代码**：服务器上 `cd /root/projects/link-projects && git pull && cd server && npm install && npm run build && systemctl restart link-server`。部署改为从 GitHub 拉取（systemd 托管：开机自启、崩溃自动拉起）；客户端管理（白名单增删改）与服务器本机文件浏览（`@server`）需要 server 为新版，旧版 server 会把这些消息当普通转发而报「客户端不在线」。
+- **更新 server 代码**：服务器上 `cd /root/projects/link-projects && git pull && cd server && npm install && npm run build && systemctl restart link-server`。部署改为从 GitHub 拉取（systemd 托管：开机自启、崩溃自动拉起）；客户端管理（白名单增删改）与服务器本机文件浏览（`@server`）需要 server 为新版，旧版 server 会把这些消息当普通转发而报「客户端不在线」。项目页签需要 server 与 client 同时为新版（旧 server 不放行 `projects` 响应、旧 client 不处理 `project-*` 请求）。
 - **更新 client 代码**：云电脑上 `npm run build && npm restart`。
 - **安全**：分角色 token + 每台 client 独立 token（白名单实时重读）；server 只放行 client 的指令响应类消息（exec-output / exec-exit / file-content / done），client 无法伪造 `clients` / `whitelist` 等服务端消息；当前传输为明文 ws，如需公网加密可前置 nginx TLS 或改 wss。
 - **public 文件服务**：server 配置 `PUBLIC_DIR` 后，`PORT` 端口在 ws 之外同时提供**免鉴权** http 文件服务（目录浏览 + 下载，配了 TLS 则 `TLS_PORT` 同样提供 https 版），任何人可读——只应放置可公开分享的文件；已做 `..` 路径穿越防护，服务范围严格限定在该目录内。

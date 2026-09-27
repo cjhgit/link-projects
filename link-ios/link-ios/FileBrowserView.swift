@@ -1,8 +1,9 @@
 import SwiftUI
 import UIKit
 
-// 详情区工作模式：终端 / 文件浏览器（对当前选中的客户端）
+// 详情区工作模式：项目 / 终端 / 文件浏览器（对当前选中的客户端）
 enum DetailTab: Hashable {
+    case projects
     case terminal
     case files
     case agent

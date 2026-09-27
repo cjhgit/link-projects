@@ -46,6 +46,8 @@ final class LinkSession: NSObject, URLSessionWebSocketDelegate {
     // Agent 请求同样以 reqId 关联，断线后不会依赖回调；界面可重新拉取 client 本机快照。
     private var agentCallbacks: [String: ([AgentSessionInfo]) -> Void] = [:]
     private var agentUpdateHandlers: [String: ([AgentSessionInfo]) -> Void] = [:]
+    // 项目管理请求的回调（reqId -> 回执），projects/error 按此路由到项目界面
+    private var projectCallbacks: [String: (String?, [ProjectInfo]) -> Void] = [:]
 
     private static let maxLines = 5000
     private static let targetsKey = "LINK_TARGETS" // 每个服务端各自记住的目标客户端 [serverId: clientId]
@@ -154,6 +156,10 @@ final class LinkSession: NSObject, URLSessionWebSocketDelegate {
         for callback in pendingFiles.values { callback(.failure("连接已断开")) }
         agentCallbacks.removeAll()
         agentUpdateHandlers.removeAll()
+        // 项目管理同理
+        let pendingProjects = projectCallbacks
+        projectCallbacks.removeAll()
+        for callback in pendingProjects.values { callback("连接已断开", []) }
     }
 
     // MARK: - WebSocket 收发
@@ -326,12 +332,20 @@ final class LinkSession: NSObject, URLSessionWebSocketDelegate {
                 callback(.failure(message))
                 return
             }
+            // 项目管理类请求的错误（目录为空、找不到项目等）
+            if let reqId, let callback = projectCallbacks.removeValue(forKey: reqId) {
+                callback(message, [])
+                return
+            }
             append("[错误] \(message)", .system)
             appendSeparator()
 
         case .agentSessions(let reqId, let targetId, let sessions):
             if let callback = agentCallbacks.removeValue(forKey: reqId) { callback(sessions) }
             else { agentUpdateHandlers[targetId]?(sessions) }
+
+        case .projects(let reqId, _, let projects):
+            if let callback = projectCallbacks.removeValue(forKey: reqId) { callback(nil, projects) }
         }
     }
 
@@ -365,6 +379,32 @@ final class LinkSession: NSObject, URLSessionWebSocketDelegate {
         let reqId = UUID().uuidString
         agentCallbacks[reqId] = completion
         send(OutgoingMessage.agentDelete(reqId: reqId, targetId: targetId, sessionId: sessionId))
+    }
+
+    // MARK: - 项目管理（项目数据在 client 本机持久化，不在 server 保存）
+
+    /// 拉取目标客户端的项目列表；completion 参数为 nil 表示成功，否则为错误信息（此时列表为空）
+    func listProjects(targetId: String, completion: @escaping (String?, [ProjectInfo]) -> Void) {
+        guard state == .connected else { return completion("未连接服务器", []) }
+        let reqId = UUID().uuidString
+        projectCallbacks[reqId] = completion
+        send(OutgoingMessage.projectList(reqId: reqId, targetId: targetId))
+    }
+
+    /// 新增（projectId 为 nil）或更新项目；completion 参数为 nil 表示成功，否则为错误信息
+    func saveProject(targetId: String, projectId: String?, name: String, path: String, completion: @escaping (String?, [ProjectInfo]) -> Void) {
+        guard state == .connected else { return completion("未连接服务器", []) }
+        let reqId = UUID().uuidString
+        projectCallbacks[reqId] = completion
+        send(OutgoingMessage.projectSave(reqId: reqId, targetId: targetId, projectId: projectId, name: name, path: path))
+    }
+
+    /// 删除项目（只删 client 本机的记录，不删除项目目录本身）
+    func deleteProject(targetId: String, projectId: String, completion: @escaping (String?, [ProjectInfo]) -> Void) {
+        guard state == .connected else { return completion("未连接服务器", []) }
+        let reqId = UUID().uuidString
+        projectCallbacks[reqId] = completion
+        send(OutgoingMessage.projectDelete(reqId: reqId, targetId: targetId, projectId: projectId))
     }
 
     // MARK: - 输入处理（对齐 handleLine）

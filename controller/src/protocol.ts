@@ -143,6 +143,13 @@ export interface AgentStatusMsg { type: 'agent-status'; reqId: string; targetId:
 export interface AgentDeleteMsg { type: 'agent-delete'; reqId: string; targetId: string; sessionId: string; }
 export interface AgentSessionsMsg { type: 'agent-sessions'; reqId: string; targetId: string; sessions: AgentSession[]; }
 
+// ===== 项目（常用目录，只保存在 client 本机 ~/.link-projects/projects.json） =====
+export interface Project { projectId: string; name: string; path: string; createdAt: number; updatedAt: number; }
+export interface ProjectListMsg { type: 'project-list'; reqId: string; targetId: string; }
+export interface ProjectSaveMsg { type: 'project-save'; reqId: string; targetId: string; projectId?: string; name: string; path: string; }
+export interface ProjectDeleteMsg { type: 'project-delete'; reqId: string; targetId: string; projectId: string; }
+export interface ProjectsMsg { type: 'projects'; reqId: string; targetId: string; projects: Project[]; }
+
 // ===== 客户端白名单管理（controller -> server 直接处理，响应也由 server 回给 controller） =====
 
 // 查询服务端 clients.json 全量白名单
@@ -181,7 +188,7 @@ export interface ClientRemoveMsg {
   clientId: string;
 }
 
-export type ClientToServerMsg = RegisterMsg | ExecOutputMsg | ExecExitMsg | FileContentMsg | FileListingMsg | DoneMsg | AgentSessionsMsg;
+export type ClientToServerMsg = RegisterMsg | ExecOutputMsg | ExecExitMsg | FileContentMsg | FileListingMsg | DoneMsg | AgentSessionsMsg | ProjectsMsg;
 export type ServerMsg =
   | RegisteredMsg
   | ClientsMsg
@@ -192,6 +199,7 @@ export type ServerMsg =
   | FileDeleteMsg
   | FileListMsg
   | AgentListMsg | AgentRunMsg | AgentStatusMsg | AgentDeleteMsg | AgentSessionsMsg
+  | ProjectListMsg | ProjectSaveMsg | ProjectDeleteMsg | ProjectsMsg
   | DoneMsg
   | WhitelistMsg
   | ErrorMsg;

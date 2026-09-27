@@ -1,36 +1,58 @@
 import SwiftUI
 
-// 详情区工作模式：终端 / 文件浏览器（对当前选中的客户端）
+// 详情区工作模式：项目 / 终端 / 文件浏览器（对当前选中的客户端）
 enum DetailTab: Hashable {
+    case projects
     case terminal
     case files
     case agent
 }
 
-// 已连接服务端的详情区：顶部切换终端 / 文件，各自独占剩余空间
+// 已连接服务端的详情区：顶部切换项目 / 终端 / 文件 / Agent，各自独占剩余空间。
+// 项目页发起的跳转（打开目录 / 新建会话）通过 filesDir / agentCwd 传给对应页面
 struct WorkspaceView: View {
     let session: LinkSession
-    @State private var tab: DetailTab = .terminal
+    @State private var tab: DetailTab = .projects
+    @State private var filesDir: String? // 「文件」页要定位的目录（项目页发起）
+    @State private var agentCwd: String? // 「Agent」页新建会话预填的工作目录（项目页发起）
 
     var body: some View {
         VStack(spacing: 0) {
             Picker("工作模式", selection: $tab) {
+                Text("项目").tag(DetailTab.projects)
                 Text("终端").tag(DetailTab.terminal)
                 Text("文件").tag(DetailTab.files)
                 Text("Agent").tag(DetailTab.agent)
             }
             .pickerStyle(.segmented)
-            .frame(width: 320)
+            .frame(width: 360)
             .padding(.vertical, 8)
             Divider()
             switch tab {
+            case .projects:
+                ProjectView(
+                    session: session,
+                    onOpenFiles: { dir in
+                        filesDir = dir
+                        tab = .files
+                    },
+                    onNewAgent: { cwd in
+                        agentCwd = cwd
+                        tab = .agent
+                    }
+                )
             case .terminal:
                 TerminalView(session: session)
             case .files:
-                FileBrowserView(session: session)
+                FileBrowserView(session: session, initialDir: filesDir ?? "~")
             case .agent:
-                AgentView(session: session)
+                AgentView(session: session, initialCwd: agentCwd)
             }
+        }
+        // 切换目标客户端后，项目页留下的定位目录 / 工作目录属于另一台机器，一并清掉
+        .onChange(of: session.currentTarget) { _, _ in
+            filesDir = nil
+            agentCwd = nil
         }
     }
 }
@@ -39,6 +61,7 @@ struct WorkspaceView: View {
 
 struct FileBrowserView: View {
     let session: LinkSession
+    var initialDir: String = "~" // 起始目录（项目页跳转时为项目目录）
 
     @State private var path = "" // 当前目录（客户端展开 ~ 后的实际路径），空 = 未加载
     @State private var entries: [FileEntryInfo] = []
@@ -123,7 +146,12 @@ struct FileBrowserView: View {
                 ? "目录“\(entry.name)”及其全部内容将被递归删除，此操作不可恢复"
                 : "文件“\(entry.name)”将被删除，此操作不可恢复")
         }
-        .onAppear { if path.isEmpty { load("~") } }
+        .onAppear { if path.isEmpty { load(initialDir) } }
+        // 项目页发起定位时视图可能未销毁重建，监听起始目录变化
+        .onChange(of: initialDir) { _, newDir in
+            guard newDir != path else { return }
+            navigate(newDir)
+        }
         .onChange(of: session.currentTarget) { _, _ in
             // 切换目标客户端后浏览另一台机器，目录与历史全部重置
             path = ""

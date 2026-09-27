@@ -383,18 +383,22 @@ private struct ClientListView: View {
     }
 }
 
-// MARK: - 工作区：选中客户端后的操作页（终端 / 文件切换）
+// MARK: - 工作区：选中客户端后的操作页（项目 / 终端 / 文件 / Agent 切换）。
+// 项目页发起的跳转（打开目录 / 新建会话）通过 filesDir / agentCwd 传给对应页面
 
 private struct WorkspaceView: View {
     @Environment(AppModel.self) private var model
     let serverId: UUID
     let clientId: String
-    @State private var tab: DetailTab = .terminal
+    @State private var tab: DetailTab = .projects
+    @State private var filesDir: String? // 「文件」页要定位的目录（项目页发起）
+    @State private var agentCwd: String? // 「Agent」页新建会话预填的工作目录（项目页发起）
 
     var body: some View {
         if let session = model.sessions[serverId] {
             VStack(spacing: 0) {
                 Picker("工作模式", selection: $tab) {
+                    Text("项目").tag(DetailTab.projects)
                     Text("终端").tag(DetailTab.terminal)
                     Text("文件").tag(DetailTab.files)
                     Text("Agent").tag(DetailTab.agent)
@@ -404,12 +408,24 @@ private struct WorkspaceView: View {
                 .padding(.vertical, 8)
                 Divider()
                 switch tab {
+                case .projects:
+                    ProjectView(
+                        session: session,
+                        onOpenFiles: { dir in
+                            filesDir = dir
+                            tab = .files
+                        },
+                        onNewAgent: { cwd in
+                            agentCwd = cwd
+                            tab = .agent
+                        }
+                    )
                 case .terminal:
                     TerminalView(session: session)
                 case .files:
-                    FileBrowserView(session: session, path: "~", resetsOnTargetChange: true)
+                    FileBrowserView(session: session, path: filesDir ?? "~", resetsOnTargetChange: true)
                 case .agent:
-                    AgentView(session: session)
+                    AgentView(session: session, initialCwd: agentCwd)
                 }
             }
             .navigationTitle(session.currentTargetDisplay)
@@ -419,6 +435,11 @@ private struct WorkspaceView: View {
                 if session.currentTarget != clientId {
                     session.currentTarget = clientId
                 }
+            }
+            // 切换目标客户端后，项目页留下的定位目录 / 工作目录属于另一台机器，一并清掉
+            .onChange(of: session.currentTarget) { _, _ in
+                filesDir = nil
+                agentCwd = nil
             }
             .toolbar {
                 ToolbarItem(placement: .topBarTrailing) {

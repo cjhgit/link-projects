@@ -28,6 +28,10 @@ import type {
   AgentStatusMsg,
   AgentDeleteMsg,
   AgentSession,
+  ProjectListMsg,
+  ProjectSaveMsg,
+  ProjectDeleteMsg,
+  Project,
 } from './protocol';
 
 // ---------- 命令行解析：start（默认，后台运行）/ stop / status / restart / run（前台调试） ----------
@@ -68,6 +72,9 @@ const AGENT_SESSIONS_FILE = join(RUNTIME_DIR, 'claude-sessions.json');
 const DEFAULT_AGENT_CWD = join(RUNTIME_DIR, 'workspace');
 const agentProcesses = new Map<string, ChildProcess>();
 let agentSessions: AgentSession[] = [];
+// 项目（常用目录）同样属于云电脑，保存在本机。
+const PROJECTS_FILE = join(RUNTIME_DIR, 'projects.json');
+let projects: Project[] = [];
 
 // ---------- 日志加时间戳（后台写文件后便于排查） ----------
 
@@ -337,6 +344,12 @@ function connect() {
         return handleAgentStatus(msg as AgentStatusMsg);
       case 'agent-delete':
         return handleAgentDelete(msg as AgentDeleteMsg);
+      case 'project-list':
+        return handleProjectList(msg as ProjectListMsg);
+      case 'project-save':
+        return handleProjectSave(msg as ProjectSaveMsg);
+      case 'project-delete':
+        return handleProjectDelete(msg as ProjectDeleteMsg);
     }
   });
 
@@ -538,6 +551,75 @@ function handleAgentRun(msg: AgentRunMsg) {
   });
 }
 
+// ---------- 项目（常用目录，本机持久化） ----------
+
+async function loadProjects(): Promise<void> {
+  try {
+    const parsed = JSON.parse(await readFile(PROJECTS_FILE, 'utf8'));
+    projects = Array.isArray(parsed) ? parsed : [];
+  } catch (err: any) {
+    if (err?.code !== 'ENOENT') console.error(`[project] 读取项目失败: ${err.message}`);
+    projects = [];
+  }
+}
+
+async function persistProjects(): Promise<void> {
+  await mkdir(RUNTIME_DIR, { recursive: true });
+  const tmp = `${PROJECTS_FILE}.tmp`;
+  await writeFile(tmp, JSON.stringify(projects, null, 2), 'utf8');
+  await rename(tmp, PROJECTS_FILE);
+}
+
+function replyProjects(reqId: string, targetId: string) {
+  // 按创建顺序返回（即添加顺序），列表不依赖 controller 保留任何状态。
+  reply({ type: 'projects', reqId, targetId, projects: [...projects].sort((a, b) => a.createdAt - b.createdAt) });
+}
+
+function handleProjectList(msg: ProjectListMsg) {
+  replyProjects(msg.reqId, msg.targetId);
+}
+
+async function handleProjectSave(msg: ProjectSaveMsg) {
+  const rawPath = msg.path.trim();
+  if (!rawPath) return reply({ type: 'error', reqId: msg.reqId, message: '项目目录不能为空' });
+  // ~ 开头展开为家目录，其余按绝对路径保存
+  const path = rawPath === '~' || rawPath.startsWith('~/') ? join(homedir(), rawPath.slice(1)) : rawPath;
+  const name = msg.name.trim() || (path.split('/').filter(Boolean).pop() ?? path);
+  const now = Date.now();
+  const existing = msg.projectId ? projects.find((item) => item.projectId === msg.projectId) : undefined;
+  if (msg.projectId && !existing) {
+    return reply({ type: 'error', reqId: msg.reqId, message: '找不到该项目（它可能已在云电脑上被删除）' });
+  }
+  if (existing) {
+    existing.name = name;
+    existing.path = path;
+    existing.updatedAt = now;
+  } else {
+    projects.push({ projectId: randomUUID(), name, path, createdAt: now, updatedAt: now });
+  }
+  console.log(`[project] ${existing ? '更新' : '新增'} ${name} (${path})`);
+  try {
+    await persistProjects();
+    replyProjects(msg.reqId, msg.targetId);
+  } catch (err: any) {
+    reply({ type: 'error', reqId: msg.reqId, message: `保存项目失败: ${err.message}` });
+  }
+}
+
+async function handleProjectDelete(msg: ProjectDeleteMsg) {
+  const index = projects.findIndex((item) => item.projectId === msg.projectId);
+  if (index < 0) return reply({ type: 'error', reqId: msg.reqId, message: '找不到该项目' });
+  // 仅删除 ~/.link-projects/projects.json 中的条目，不触碰项目目录本身。
+  const [removed] = projects.splice(index, 1);
+  console.log(`[project] 删除 ${removed.name} (${removed.path})`);
+  try {
+    await persistProjects();
+    replyProjects(msg.reqId, msg.targetId);
+  } catch (err: any) {
+    reply({ type: 'error', reqId: msg.reqId, message: `删除项目失败: ${err.message}` });
+  }
+}
+
 function handleExec(msg: ExecMsg) {
   console.log(`[exec] ${msg.command}${msg.cwd ? ` (cwd: ${msg.cwd})` : ''}`);
   const child = spawn('/bin/bash', ['-c', msg.command], {
@@ -653,6 +735,7 @@ async function runForeground(): Promise<void> {
   process.on('SIGINT', () => shutdown(0));
   process.on('SIGTERM', () => shutdown(0));
   await loadAgentSessions();
+  await loadProjects();
   connect();
 }
 

@@ -530,7 +530,7 @@ function onConnection(ws: WebSocket) {
 
     // client -> controller：响应广播给所有 controller，各自按 reqId 过滤。
     // 只放行指令响应类消息，防止 client 伪造 clients / whitelist 等服务端消息
-    const CLIENT_RESPONSE_TYPES = new Set(['exec-output', 'exec-exit', 'file-content', 'file-listing', 'done', 'agent-sessions']);
+    const CLIENT_RESPONSE_TYPES = new Set(['exec-output', 'exec-exit', 'file-content', 'file-listing', 'done', 'error', 'agent-sessions', 'projects']);
     if (role === 'client' && msg.type !== 'register') {
       if (!CLIENT_RESPONSE_TYPES.has(msg.type)) return;
       for (const c of controllers) send(c, msg);

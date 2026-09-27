@@ -194,6 +194,48 @@ export interface AgentSessionsMsg {
   sessions: AgentSession[];
 }
 
+// ===== 项目（常用目录，只保存在 client 本机 ~/.link-projects/projects.json） =====
+export interface Project {
+  projectId: string;
+  name: string;
+  path: string; // 项目目录（client 本机绝对路径，保存时 ~ 已展开）
+  createdAt: number;
+  updatedAt: number;
+}
+
+// 查询 client 本机持久化的项目列表；可在网络恢复后再次请求
+export interface ProjectListMsg {
+  type: 'project-list';
+  reqId: string;
+  targetId: string;
+}
+
+// 新增项目，或更新既有项目（传 projectId 且能匹配到时）
+export interface ProjectSaveMsg {
+  type: 'project-save';
+  reqId: string;
+  targetId: string;
+  projectId?: string;
+  name: string;
+  path: string; // 支持 ~ 开头，client 保存时展开为绝对路径
+}
+
+// 删除 client 本机保存的项目
+export interface ProjectDeleteMsg {
+  type: 'project-delete';
+  reqId: string;
+  targetId: string;
+  projectId: string;
+}
+
+// client 返回项目列表；不会由 server 持久化
+export interface ProjectsMsg {
+  type: 'projects';
+  reqId: string;
+  targetId: string;
+  projects: Project[];
+}
+
 // ===== 客户端白名单管理（controller -> server 直接处理，响应也由 server 回给 controller） =====
 
 // 查询服务端 clients.json 全量白名单
@@ -232,7 +274,7 @@ export interface ClientRemoveMsg {
   clientId: string;
 }
 
-export type ClientToServerMsg = RegisterMsg | ExecOutputMsg | ExecExitMsg | FileContentMsg | FileListingMsg | DoneMsg | AgentSessionsMsg;
+export type ClientToServerMsg = RegisterMsg | ExecOutputMsg | ExecExitMsg | FileContentMsg | FileListingMsg | DoneMsg | AgentSessionsMsg | ProjectsMsg;
 export type ServerMsg =
   | RegisteredMsg
   | ClientsMsg
@@ -247,6 +289,10 @@ export type ServerMsg =
   | AgentStatusMsg
   | AgentDeleteMsg
   | AgentSessionsMsg
+  | ProjectListMsg
+  | ProjectSaveMsg
+  | ProjectDeleteMsg
+  | ProjectsMsg
   | DoneMsg
   | WhitelistMsg
   | ErrorMsg;

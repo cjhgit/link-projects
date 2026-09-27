@@ -3,6 +3,7 @@ import SwiftUI
 // Claude Code 的轻量会话前端：这里只保存当前界面状态，记录与任务状态都由云电脑 client 保存。
 struct AgentView: View {
     let session: LinkSession
+    var initialCwd: String? = nil // 项目页「新建会话」跳转时预填的工作目录
     @State private var sessions: [AgentSessionInfo] = []
     @State private var selectedId: String?
     @State private var prompt = ""
@@ -52,9 +53,12 @@ struct AgentView: View {
             .onAppear {
                 session.observeAgentUpdates(targetId: targetId) { applyUpdates($0) }
                 refresh(targetId)
+                prepareNewSession()
             }
             .onDisappear { session.stopObservingAgentUpdates(targetId: targetId) }
             .onChange(of: session.currentTarget) { _, _ in if let current = self.targetId { refresh(current) } }
+            // 项目页再次发起「新建会话」时更新预填目录
+            .onChange(of: initialCwd) { _, _ in prepareNewSession() }
         } else {
             ContentUnavailableView("请选择在线云电脑", systemImage: "desktopcomputer", description: Text("Agent 仅运行在已在线的客户端；服务器主机不提供此功能。"))
         }
@@ -100,6 +104,14 @@ struct AgentView: View {
             }
             if isResponding { Text("任务正在云电脑执行；网络断开后仍可稍后刷新查看结果。").font(.caption).foregroundStyle(.secondary).frame(maxWidth: .infinity, alignment: .leading) }
         }.padding(10)
+    }
+
+    // 项目页发起的「新建会话」：切到新建状态并预填工作目录
+    private func prepareNewSession() {
+        guard let initialCwd, !initialCwd.isEmpty else { return }
+        selectedId = nil
+        prompt = ""
+        cwd = initialCwd
     }
 
     private func refresh(_ targetId: String) {
