@@ -399,6 +399,7 @@ private struct WorkspaceView: View {
             VStack(spacing: 0) {
                 Picker("工作模式", selection: $tab) {
                     Text("项目").tag(DetailTab.projects)
+                    Text("命令").tag(DetailTab.commands)
                     Text("终端").tag(DetailTab.terminal)
                     Text("文件").tag(DetailTab.files)
                     Text("Agent").tag(DetailTab.agent)
@@ -420,6 +421,11 @@ private struct WorkspaceView: View {
                             tab = .agent
                         }
                     )
+                case .commands:
+                    TerminalCommandView(session: session) { command in
+                        session.submit(command)
+                        tab = .terminal
+                    }
                 case .terminal:
                     TerminalView(session: session)
                 case .files:

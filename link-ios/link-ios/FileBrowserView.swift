@@ -5,6 +5,7 @@ import UniformTypeIdentifiers
 // 详情区工作模式：项目 / 终端 / 文件浏览器（对当前选中的客户端）
 enum DetailTab: Hashable {
     case projects
+    case commands
     case terminal
     case files
     case agent

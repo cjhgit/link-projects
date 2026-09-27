@@ -195,6 +195,11 @@ export interface ProjectListMsg { type: 'project-list'; reqId: string; targetId:
 export interface ProjectSaveMsg { type: 'project-save'; reqId: string; targetId: string; projectId?: string; name: string; path: string; }
 export interface ProjectDeleteMsg { type: 'project-delete'; reqId: string; targetId: string; projectId: string; }
 export interface ProjectsMsg { type: 'projects'; reqId: string; targetId: string; projects: Project[]; }
+export interface TerminalCommand { commandId: string; name: string; command: string; createdAt: number; updatedAt: number; }
+export interface TerminalCommandListMsg { type: 'terminal-command-list'; reqId: string; targetId: string; }
+export interface TerminalCommandSaveMsg { type: 'terminal-command-save'; reqId: string; targetId: string; commandId?: string; name: string; command: string; }
+export interface TerminalCommandDeleteMsg { type: 'terminal-command-delete'; reqId: string; targetId: string; commandId: string; }
+export interface TerminalCommandsMsg { type: 'terminal-commands'; reqId: string; targetId: string; commands: TerminalCommand[]; }
 
 // ===== 客户端白名单管理（controller -> server 直接处理，响应也由 server 回给 controller） =====
 
@@ -234,7 +239,7 @@ export interface ClientRemoveMsg {
   clientId: string;
 }
 
-export type ClientToServerMsg = RegisterMsg | ExecOutputMsg | ExecExitMsg | FileContentMsg | FileListingMsg | DoneMsg | AgentSessionsMsg | ProjectsMsg | FileDownloadDataMsg;
+export type ClientToServerMsg = RegisterMsg | ExecOutputMsg | ExecExitMsg | FileContentMsg | FileListingMsg | DoneMsg | AgentSessionsMsg | ProjectsMsg | TerminalCommandsMsg | FileDownloadDataMsg;
 export type ServerMsg =
   | RegisteredMsg
   | ClientsMsg
@@ -251,6 +256,7 @@ export type ServerMsg =
   | FileDownloadDataMsg
   | AgentListMsg | AgentRunMsg | AgentStatusMsg | AgentDeleteMsg | AgentSessionsMsg
   | ProjectListMsg | ProjectSaveMsg | ProjectDeleteMsg | ProjectsMsg
+  | TerminalCommandListMsg | TerminalCommandSaveMsg | TerminalCommandDeleteMsg | TerminalCommandsMsg
   | DoneMsg
   | WhitelistMsg
   | ErrorMsg;

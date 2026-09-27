@@ -69,6 +69,7 @@ nonisolated struct AgentSessionInfo: Identifiable, Equatable { let sessionId: St
 
 // 项目（常用目录）快照；真实持久化文件仅位于云电脑 client 的 ~/.link-projects/projects.json
 nonisolated struct ProjectInfo: Identifiable, Equatable { let projectId: String; let name: String; let path: String; let createdAt: Double; let updatedAt: Double; var id: String { projectId } }
+nonisolated struct TerminalCommandInfo: Identifiable, Equatable { let commandId: String; let name: String; let command: String; let createdAt: Double; let updatedAt: Double; var id: String { commandId } }
 
 // 输出条目类型：stdout/stderr 为命令输出，system 为本地系统消息，command 为输入回显，separator 为每次交互结束的分隔线
 nonisolated enum OutputKind: Equatable {
@@ -100,6 +101,7 @@ nonisolated enum IncomingMessage {
     case error(reqId: String?, message: String)
     case agentSessions(reqId: String, targetId: String, sessions: [AgentSessionInfo])
     case projects(reqId: String, targetId: String, projects: [ProjectInfo])
+    case terminalCommands(reqId: String, targetId: String, commands: [TerminalCommandInfo])
 
     static func parse(_ text: String) -> IncomingMessage? {
         guard let data = text.data(using: .utf8),
@@ -201,6 +203,9 @@ nonisolated enum IncomingMessage {
                 ProjectInfo(projectId: $0["projectId"] as? String ?? "", name: $0["name"] as? String ?? "", path: $0["path"] as? String ?? "", createdAt: $0["createdAt"] as? Double ?? 0, updatedAt: $0["updatedAt"] as? Double ?? 0)
             }
             return .projects(reqId: obj["reqId"] as? String ?? "", targetId: obj["targetId"] as? String ?? "", projects: list)
+        case "terminal-commands":
+            let list = (obj["commands"] as? [[String: Any]] ?? []).map { TerminalCommandInfo(commandId: $0["commandId"] as? String ?? "", name: $0["name"] as? String ?? "", command: $0["command"] as? String ?? "", createdAt: $0["createdAt"] as? Double ?? 0, updatedAt: $0["updatedAt"] as? Double ?? 0) }
+            return .terminalCommands(reqId: obj["reqId"] as? String ?? "", targetId: obj["targetId"] as? String ?? "", commands: list)
         default:
             return nil
         }
@@ -256,6 +261,9 @@ nonisolated enum OutgoingMessage {
     static func projectList(reqId: String, targetId: String) -> String { json(["type": "project-list", "reqId": reqId, "targetId": targetId]) }
     static func projectSave(reqId: String, targetId: String, projectId: String?, name: String, path: String) -> String { var value: [String: Any] = ["type": "project-save", "reqId": reqId, "targetId": targetId, "name": name, "path": path]; if let projectId { value["projectId"] = projectId }; return json(value) }
     static func projectDelete(reqId: String, targetId: String, projectId: String) -> String { json(["type": "project-delete", "reqId": reqId, "targetId": targetId, "projectId": projectId]) }
+    static func terminalCommandList(reqId: String, targetId: String) -> String { json(["type": "terminal-command-list", "reqId": reqId, "targetId": targetId]) }
+    static func terminalCommandSave(reqId: String, targetId: String, commandId: String?, name: String, command: String) -> String { var value: [String: Any] = ["type": "terminal-command-save", "reqId": reqId, "targetId": targetId, "name": name, "command": command]; if let commandId { value["commandId"] = commandId }; return json(value) }
+    static func terminalCommandDelete(reqId: String, targetId: String, commandId: String) -> String { json(["type": "terminal-command-delete", "reqId": reqId, "targetId": targetId, "commandId": commandId]) }
 
     // 白名单管理（server 直接处理，不带 targetId）
     static func listWhitelist(reqId: String) -> String {

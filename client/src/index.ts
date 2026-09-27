@@ -37,6 +37,10 @@ import type {
   ProjectSaveMsg,
   ProjectDeleteMsg,
   Project,
+  TerminalCommandListMsg,
+  TerminalCommandSaveMsg,
+  TerminalCommandDeleteMsg,
+  TerminalCommand,
 } from './protocol';
 
 // ---------- 命令行解析：start（默认，后台运行）/ stop / status / restart / run（前台调试） ----------
@@ -80,6 +84,8 @@ let agentSessions: AgentSession[] = [];
 // 项目（常用目录）同样属于云电脑，保存在本机。
 const PROJECTS_FILE = join(RUNTIME_DIR, 'projects.json');
 let projects: Project[] = [];
+const TERMINAL_COMMANDS_FILE = join(RUNTIME_DIR, 'terminal-commands.json');
+let terminalCommands: TerminalCommand[] = [];
 
 // ---------- 日志加时间戳（后台写文件后便于排查） ----------
 
@@ -369,6 +375,12 @@ function connect() {
         return handleProjectSave(msg as ProjectSaveMsg);
       case 'project-delete':
         return handleProjectDelete(msg as ProjectDeleteMsg);
+      case 'terminal-command-list':
+        return handleTerminalCommandList(msg as TerminalCommandListMsg);
+      case 'terminal-command-save':
+        return handleTerminalCommandSave(msg as TerminalCommandSaveMsg);
+      case 'terminal-command-delete':
+        return handleTerminalCommandDelete(msg as TerminalCommandDeleteMsg);
     }
   });
 
@@ -641,6 +653,61 @@ async function handleProjectDelete(msg: ProjectDeleteMsg) {
   }
 }
 
+// ---------- 终端常用命令（本机持久化） ----------
+
+async function loadTerminalCommands(): Promise<void> {
+  try {
+    const parsed = JSON.parse(await readFile(TERMINAL_COMMANDS_FILE, 'utf8'));
+    terminalCommands = Array.isArray(parsed) ? parsed : [];
+  } catch (err: any) {
+    if (err?.code !== 'ENOENT') console.error(`[terminal-command] 读取失败: ${err.message}`);
+    terminalCommands = [];
+  }
+}
+
+async function persistTerminalCommands(): Promise<void> {
+  await mkdir(RUNTIME_DIR, { recursive: true });
+  const tmp = `${TERMINAL_COMMANDS_FILE}.tmp`;
+  await writeFile(tmp, JSON.stringify(terminalCommands, null, 2), 'utf8');
+  await rename(tmp, TERMINAL_COMMANDS_FILE);
+}
+
+function replyTerminalCommands(reqId: string, targetId: string) {
+  reply({ type: 'terminal-commands', reqId, targetId, commands: [...terminalCommands].sort((a, b) => a.createdAt - b.createdAt) });
+}
+
+function handleTerminalCommandList(msg: TerminalCommandListMsg) { replyTerminalCommands(msg.reqId, msg.targetId); }
+
+async function handleTerminalCommandSave(msg: TerminalCommandSaveMsg) {
+  const command = msg.command.trim();
+  if (!command) return reply({ type: 'error', reqId: msg.reqId, message: '命令内容不能为空' });
+  const name = msg.name.trim() || command.split(/\s+/)[0];
+  const now = Date.now();
+  const existing = msg.commandId ? terminalCommands.find((item) => item.commandId === msg.commandId) : undefined;
+  if (msg.commandId && !existing) return reply({ type: 'error', reqId: msg.reqId, message: '找不到该常用命令' });
+  if (existing) {
+    existing.name = name;
+    existing.command = command;
+    existing.updatedAt = now;
+  } else {
+    terminalCommands.push({ commandId: randomUUID(), name, command, createdAt: now, updatedAt: now });
+  }
+  try {
+    await persistTerminalCommands();
+    replyTerminalCommands(msg.reqId, msg.targetId);
+  } catch (err: any) { reply({ type: 'error', reqId: msg.reqId, message: `保存常用命令失败: ${err.message}` }); }
+}
+
+async function handleTerminalCommandDelete(msg: TerminalCommandDeleteMsg) {
+  const index = terminalCommands.findIndex((item) => item.commandId === msg.commandId);
+  if (index < 0) return reply({ type: 'error', reqId: msg.reqId, message: '找不到该常用命令' });
+  terminalCommands.splice(index, 1);
+  try {
+    await persistTerminalCommands();
+    replyTerminalCommands(msg.reqId, msg.targetId);
+  } catch (err: any) { reply({ type: 'error', reqId: msg.reqId, message: `删除常用命令失败: ${err.message}` }); }
+}
+
 function handleExec(msg: ExecMsg) {
   console.log(`[exec] ${msg.command}${msg.cwd ? ` (cwd: ${msg.cwd})` : ''}`);
   const child = spawn('/bin/bash', ['-c', msg.command], {
@@ -855,6 +922,7 @@ async function runForeground(): Promise<void> {
   process.on('SIGTERM', () => shutdown(0));
   await loadAgentSessions();
   await loadProjects();
+  await loadTerminalCommands();
   connect();
 }
 

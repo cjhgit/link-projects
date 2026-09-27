@@ -57,6 +57,7 @@ final class LinkSession: NSObject, URLSessionWebSocketDelegate {
     private var agentUpdateHandlers: [String: ([AgentSessionInfo]) -> Void] = [:]
     // 项目管理请求的回调（reqId -> 回执），projects/error 按此路由到项目界面
     private var projectCallbacks: [String: (String?, [ProjectInfo]) -> Void] = [:]
+    private var terminalCommandCallbacks: [String: (String?, [TerminalCommandInfo]) -> Void] = [:]
 
     private static let maxLines = 5000
     private static let targetsKey = "LINK_TARGETS" // 每个服务端各自记住的目标客户端 [serverId: clientId]
@@ -159,6 +160,9 @@ final class LinkSession: NSObject, URLSessionWebSocketDelegate {
         let pendingProjects = projectCallbacks
         projectCallbacks.removeAll()
         for callback in pendingProjects.values { callback("连接已断开", []) }
+        let pendingTerminalCommands = terminalCommandCallbacks
+        terminalCommandCallbacks.removeAll()
+        for callback in pendingTerminalCommands.values { callback("连接已断开", []) }
     }
 
     // MARK: - WebSocket 收发
@@ -343,6 +347,10 @@ final class LinkSession: NSObject, URLSessionWebSocketDelegate {
                 callback(message, [])
                 return
             }
+            if let reqId, let callback = terminalCommandCallbacks.removeValue(forKey: reqId) {
+                callback(message, [])
+                return
+            }
             append("[错误] \(message)", .system)
             appendSeparator()
 
@@ -352,6 +360,9 @@ final class LinkSession: NSObject, URLSessionWebSocketDelegate {
 
         case .projects(let reqId, _, let projects):
             if let callback = projectCallbacks.removeValue(forKey: reqId) { callback(nil, projects) }
+
+        case .terminalCommands(let reqId, _, let commands):
+            if let callback = terminalCommandCallbacks.removeValue(forKey: reqId) { callback(nil, commands) }
         }
     }
 
@@ -417,6 +428,23 @@ final class LinkSession: NSObject, URLSessionWebSocketDelegate {
         let reqId = UUID().uuidString
         projectCallbacks[reqId] = completion
         send(OutgoingMessage.projectDelete(reqId: reqId, targetId: targetId, projectId: projectId))
+    }
+
+    // MARK: - 终端常用命令（数据在 client 本机持久化）
+    func listTerminalCommands(targetId: String, completion: @escaping (String?, [TerminalCommandInfo]) -> Void) {
+        guard state == .connected else { return completion("未连接服务器", []) }
+        let reqId = UUID().uuidString; terminalCommandCallbacks[reqId] = completion
+        send(OutgoingMessage.terminalCommandList(reqId: reqId, targetId: targetId))
+    }
+    func saveTerminalCommand(targetId: String, commandId: String?, name: String, command: String, completion: @escaping (String?, [TerminalCommandInfo]) -> Void) {
+        guard state == .connected else { return completion("未连接服务器", []) }
+        let reqId = UUID().uuidString; terminalCommandCallbacks[reqId] = completion
+        send(OutgoingMessage.terminalCommandSave(reqId: reqId, targetId: targetId, commandId: commandId, name: name, command: command))
+    }
+    func deleteTerminalCommand(targetId: String, commandId: String, completion: @escaping (String?, [TerminalCommandInfo]) -> Void) {
+        guard state == .connected else { return completion("未连接服务器", []) }
+        let reqId = UUID().uuidString; terminalCommandCallbacks[reqId] = completion
+        send(OutgoingMessage.terminalCommandDelete(reqId: reqId, targetId: targetId, commandId: commandId))
     }
 
     // MARK: - 输入处理（对齐 handleLine）
