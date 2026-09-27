@@ -1,6 +1,6 @@
 {
   "name": "link-client",
-  "version": "26.9.2701",
+  "version": "26.9.2702",
   "private": true,
   "description": "远程控制客户端：部署在云电脑（无公网 IP），主动连接服务端并执行指令",
   "scripts": {
