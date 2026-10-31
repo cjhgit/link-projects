@@ -31,8 +31,10 @@ struct AgentView: View {
                 VStack(spacing: 0) {
                     Picker("范围", selection: $scope) {
                         Text("会话").tag(AgentListScope.mine)
-                        Text("Claude 历史").tag(AgentListScope.claudeHistory)
-                        Text("Codex 历史").tag(AgentListScope.codexHistory)
+                        Text("Claude").tag(AgentListScope.claudeHistory)
+                        Text("Codex").tag(AgentListScope.codexHistory)
+                        Text("Cursor").tag(AgentListScope.cursorHistory)
+                        Text("Pi").tag(AgentListScope.piHistory)
                     }
                     .pickerStyle(.segmented)
                     .padding(.horizontal, 8).padding(.vertical, 6)
@@ -49,7 +51,7 @@ struct AgentView: View {
                                         Text("外部").font(.caption2).foregroundStyle(.secondary).padding(.horizontal, 5).padding(.vertical, 1).background(Color.cyan.opacity(0.18)).clipShape(Capsule())
                                             .help("在云电脑上由 Claude Code 直接发起、经本软件继续过对话的会话")
                                     }
-                                    Text(item.agent == .codex ? "Codex" : "Claude").font(.caption2).foregroundStyle(.secondary).padding(.horizontal, 5).padding(.vertical, 1).background(Color.secondary.opacity(0.15)).clipShape(Capsule())
+                                    Text(item.agent.badge).font(.caption2).foregroundStyle(.secondary).padding(.horizontal, 5).padding(.vertical, 1).background(Color.secondary.opacity(0.15)).clipShape(Capsule())
                                     // Claude 历史的状态只由官方 jsonl 决定（存在即完整），不显示本软件的运行状态
                                     stateIcon(scope == .mine ? item.state : .completed)
                                 }
@@ -174,6 +176,8 @@ struct AgentView: View {
                     Picker("CLI", selection: $agentKind) {
                         Text("Claude Code").tag(AgentKind.claude)
                         Text("Codex").tag(AgentKind.codex)
+                        Text("Cursor").tag(AgentKind.cursor)
+                        Text("Pi").tag(AgentKind.pi)
                     }.pickerStyle(.menu).labelsHidden().fixedSize().help("新建会话使用的命令行工具；Claude Code 为默认。")
                 }
             }
@@ -196,7 +200,7 @@ struct AgentView: View {
         cwd = initialCwd
     }
 
-    private var historyEmptyTitle: String { scope == .codexHistory ? "Codex 历史对话" : "Claude 历史对话" }
+    private var historyEmptyTitle: String { scope == .claudeHistory ? "Claude 历史对话" : scope == .codexHistory ? "Codex 历史对话" : scope == .cursorHistory ? "Cursor 历史对话" : "Pi 历史对话" }
 
     private func refresh(_ targetId: String) {
         loading = true

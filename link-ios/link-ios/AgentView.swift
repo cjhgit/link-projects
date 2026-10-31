@@ -86,7 +86,7 @@ struct AgentView: View {
                 } label: { Image(systemName: "chevron.left") }
                 .accessibilityLabel("返回列表")
             }
-            Text(selected?.title ?? (creating ? "新建会话" : scope == .codexHistory ? "Codex 历史" : scope == .claudeHistory ? "Claude 历史" : "会话"))
+            Text(selected?.title ?? (creating ? "新建会话" : scopeTitle))
                 .font(.headline).lineLimit(1)
             Spacer()
             if creating {
@@ -196,12 +196,25 @@ struct AgentView: View {
         scope == .mine ? item.state : .completed
     }
 
+    // header 标题：按当前 tab 显示
+    private var scopeTitle: String {
+        switch scope {
+        case .mine: "会话"
+        case .claudeHistory: "Claude 历史"
+        case .codexHistory: "Codex 历史"
+        case .cursorHistory: "Cursor 历史"
+        case .piHistory: "Pi 历史"
+        }
+    }
+
     private var sessionList: some View {
         VStack(spacing: 0) {
             Picker("范围", selection: $scope) {
                 Text("会话").tag(AgentListScope.mine)
-                Text("Claude 历史").tag(AgentListScope.claudeHistory)
-                Text("Codex 历史").tag(AgentListScope.codexHistory)
+                Text("Claude").tag(AgentListScope.claudeHistory)
+                Text("Codex").tag(AgentListScope.codexHistory)
+                Text("Cursor").tag(AgentListScope.cursorHistory)
+                Text("Pi").tag(AgentListScope.piHistory)
             }
             .pickerStyle(.segmented)
             .padding(.horizontal, 12).padding(.vertical, 6)
@@ -238,7 +251,7 @@ struct AgentView: View {
             .overlay {
                 if sessions.isEmpty && !loading {
                     ContentUnavailableView(
-                        scope == .mine ? "暂无会话" : "暂无\(scope == .codexHistory ? " Codex" : " Claude") 历史对话",
+                        scope == .mine ? "暂无会话" : "暂无\(scope == .claudeHistory ? " Claude" : scope == .codexHistory ? " Codex" : scope == .cursorHistory ? " Cursor" : " Pi") 历史对话",
                         systemImage: scope == .mine ? "bubble.left.and.bubble.right" : "clock.arrow.circlepath",
                         description: Text(scope == .mine ? "点击右上角 + 在云电脑创建 Claude Code 会话。" : "云电脑的官方会话文件里暂无可恢复的会话")
                     )
@@ -302,6 +315,8 @@ struct AgentView: View {
                     Picker("CLI", selection: $agentKind) {
                         Text("Claude Code").tag(AgentKind.claude)
                         Text("Codex").tag(AgentKind.codex)
+                        Text("Cursor").tag(AgentKind.cursor)
+                        Text("Pi").tag(AgentKind.pi)
                     }.pickerStyle(.menu).labelsHidden().fixedSize()
                         .help("新建会话使用的命令行工具；Claude Code 为默认。")
                 }

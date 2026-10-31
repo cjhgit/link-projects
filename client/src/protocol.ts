@@ -182,8 +182,8 @@ export interface ErrorMsg {
 // ===== Agent 会话（Claude Code / Codex CLI，会话记录只保存在 client 本机） =====
 export type AgentSessionState = 'running' | 'completed' | 'failed';
 
-// 底层 CLI：claude = Claude Code（默认），codex = OpenAI Codex
-export type AgentKind = 'claude' | 'codex';
+// 底层 CLI：claude = Claude Code（默认），codex = OpenAI Codex，cursor = Cursor Agent，pi = pi coding agent
+export type AgentKind = 'claude' | 'codex' | 'cursor' | 'pi';
 
 export interface AgentMessage {
   role: 'user' | 'assistant';
@@ -216,10 +216,10 @@ export interface AgentSession {
 }
 
 // 会话列表的范围：mine = 本软件发起或继续过对话的会话（默认，含从历史导入的）；
-// claudeHistory = Claude Code 官方会话文件（~/.claude/projects）里发现的历史会话；
-// codexHistory = Codex 官方会话文件（~/.codex/sessions）里发现的历史会话。
+// xxxHistory = 各 CLI 官方会话文件里发现的历史会话（claude ~/.claude/projects、
+// codex ~/.codex/sessions、cursor ~/.cursor/chats、pi ~/.pi/agent/sessions）。
 // 历史列表完全由官方文件决定，回复不改变其内容与状态。
-export type AgentListScope = 'mine' | 'claudeHistory' | 'codexHistory';
+export type AgentListScope = 'mine' | 'claudeHistory' | 'codexHistory' | 'cursorHistory' | 'piHistory';
 
 // 查询该云电脑本机持久化的会话列表；可在网络恢复后再次请求。
 // scope 缺省为 mine（旧控制端不传即只看本软件的会话）。

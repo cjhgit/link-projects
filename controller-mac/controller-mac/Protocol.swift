@@ -73,8 +73,12 @@ nonisolated enum AgentSessionState: String, Equatable {
 nonisolated enum AgentKind: String, Equatable {
     case claude
     case codex
+    case cursor
+    case pi
 
-    var displayName: String { self == .codex ? "Codex" : "Claude Code" }
+    var displayName: String { self == .codex ? "Codex" : self == .cursor ? "Cursor" : self == .pi ? "Pi" : "Claude Code" }
+    // 列表徽标用的短名
+    var badge: String { self == .claude ? "Claude" : displayName }
 }
 
 // 会话来源：link = 本软件发起；external = 从 Claude Code 官方记录中发现的外部会话
@@ -88,7 +92,7 @@ nonisolated enum AgentSessionOrigin: String, Equatable {
 nonisolated enum AgentListScope: String, Equatable {
     case mine
     case claudeHistory
-    case codexHistory
+    case codexHistory; case cursorHistory; case piHistory
 }
 
 nonisolated struct AgentMessageInfo: Identifiable, Equatable {

@@ -407,8 +407,17 @@ const CLAUDE_HISTORY_FILE = join(CLAUDE_DIR, 'history.jsonl');
 const CLAUDE_PROJECTS_DIR = join(CLAUDE_DIR, 'projects');
 // Codex 官方会话目录：按 年/月/日 分层，文件名 rollout-<时间戳>-<threadId>.jsonl
 const CODEX_SESSIONS_DIR = join(homedir(), '.codex', 'sessions');
+// Cursor Agent（CLI）官方会话目录：<chatId>/<实例uuid>/{store.db, meta.json}（消息在 SQLite blobs 表里）
+const CURSOR_CHATS_DIR = join(homedir(), '.cursor', 'chats');
+// Cursor IDE 官方数据库：composerHeaders 表为全部会话头，cursorDiskKV 表存逐条消息
+// （bubbleId:<composerId>:<bubbleId>[/s:N]）；jsonlPath 指向 .vscdb 即 IDE 会话
+const CURSOR_IDE_DB = join(homedir(), 'Library', 'Application Support', 'Cursor', 'User', 'globalStorage', 'state.vscdb');
+// pi 官方会话目录：<编码cwd>/<时间戳>_<sessionId>.jsonl（首行 session 事件带 cwd 原文）
+const PI_SESSIONS_DIR = join(homedir(), '.pi', 'agent', 'sessions');
 // 历史列表每个 tab 最多展示的条数（按最近活动排序），避免历史会话过多拖垮列表与请求耗时
 const MAX_EXTERNAL_SESSIONS = 300;
+// 支持的底层 CLI（加载旧记录时把未知值规范化为 claude）
+const AGENT_KINDS: ReadonlySet<string> = new Set(['claude', 'codex', 'cursor', 'pi']);
 
 // 持久化到 claude-sessions.json 的记录：claude / codex 会话均不维护 messages（复用官方会话文件，
 // 实时解析）。旧版 codex 记录自带的 messages 保留作兜底（官方 rollout 已被清理时仍有内容可看）。
@@ -712,7 +721,7 @@ async function loadAgentSessions(): Promise<void> {
     agentSessions = Array.isArray(parsed) ? parsed : [];
     // 旧记录没有 agent 字段，统一规范化为 claude，后续逻辑不必再判空
     for (const session of agentSessions) {
-      if (session.agent !== 'codex') session.agent = 'claude';
+      if (!AGENT_KINDS.has(session.agent ?? '')) session.agent = 'claude';
       // 迁移：claude 会话不再维护 messages（复用官方 jsonl），丢弃旧副本并补记 jsonl 路径
       if (session.agent === 'claude') {
         delete session.messages;
@@ -794,9 +803,7 @@ function runningSnapshot(session: StoredAgentSession): AgentSession {
 // codex 旧记录 rollout 已清理时回退本软件曾维护的 messages 副本。
 async function detailSnapshot(session: StoredAgentSession): Promise<AgentSession> {
   if (session.state === 'running') return runningSnapshot(session);
-  const messages = session.agent === 'codex'
-    ? await readCodexThreadMessages(session.externalId ?? session.sessionId)
-    : session.jsonlPath ? await readClaudeMessages(session.jsonlPath) : undefined;
+  const messages = await readAgentMessages(session);
   if (messages !== undefined) return { ...agentSnapshot(session), messages };
   return { ...agentSnapshot(session), messages: session.messages ?? [] };
 }
@@ -958,6 +965,454 @@ async function findExternalClaudeSession(sessionId: string): Promise<StoredAgent
   return findClaudeSessionOnDisk(sessionId);
 }
 
+// ---------- Cursor Agent 官方会话（~/.cursor/chats/<chatId>/<实例uuid>/{store.db, meta.json}） ----------
+
+// 读取 Cursor 实例的 store.db（SQLite）：消息以 JSON blob 存在 blobs 表、无时间戳字段，
+// rowid（写入序）即对话顺序；工具数据等 protobuf 行 JSON.parse 失败自然跳过。
+// node:sqlite 不可用（Node < 22.5）时返回 undefined，消息查看降级。
+function parseCursorStore(storePath: string): AgentSession['messages'] | undefined {
+  let DatabaseSync: any;
+  try {
+    ({ DatabaseSync } = require('node:sqlite'));
+  } catch {
+    return undefined;
+  }
+  let db: any;
+  try {
+    db = new DatabaseSync(storePath, { readOnly: true });
+    const messages: AgentSession['messages'] = [];
+    const rows = db.prepare('SELECT data FROM blobs ORDER BY rowid').all() as { data: Uint8Array }[];
+    for (const { data } of rows) {
+      let event: any;
+      try {
+        event = JSON.parse(Buffer.from(data).toString('utf8'));
+      } catch {
+        continue;
+      }
+      if (event?.role !== 'user' && event?.role !== 'assistant') continue;
+      const content = event.content;
+      if (typeof content === 'string') {
+        // string 形态的 user 内容是 IDE/CLI 注入（user_info 等），非真实输入
+        continue;
+      }
+      if (!Array.isArray(content)) continue;
+      const text = content
+        .filter((item: any) => item?.type === 'text' && typeof item?.text === 'string')
+        .map((item: any) => item.text)
+        .join('\n\n');
+      if (!text.trim()) continue;
+      if (event.role === 'user') {
+        // 真实输入包裹在 <user_query> 标签里（外层还带 <timestamp> 等注入）；无此标签的整条视为注入跳过
+        const q = /<user_query>\s*([\s\S]*?)\s*<\/user_query>/.exec(text);
+        if (q && q[1].trim()) pushOrMerge(messages, 'user', q[1], 0);
+      } else {
+        pushOrMerge(messages, 'assistant', text, 0);
+      }
+    }
+    return messages;
+  } catch {
+    return undefined;
+  } finally {
+    try { db?.close(); } catch { /* 忽略 */ }
+  }
+}
+
+// 读取 Cursor IDE 的会话消息（state.vscdb 的 cursorDiskKV）：
+// 每条消息为 bubbleId:<composerId>:<bubbleId>，assistant 回复按 /s:N 分片存放（独立增量，拼接即全文），
+// /t:call-* 为工具数据跳过；bubble 间按 createdAt 排序。
+function parseCursorIdeMessages(dbPath: string, composerId: string): AgentSession['messages'] | undefined {
+  let DatabaseSync: any;
+  try {
+    ({ DatabaseSync } = require('node:sqlite'));
+  } catch {
+    return undefined;
+  }
+  let db: any;
+  try {
+    db = new DatabaseSync(dbPath, { readOnly: true });
+    // 字典序 range 查询（LIKE 'prefix%' 在此表上不走索引、会全表扫描 14GB 库）；
+    // LIMIT 兜底防极端会话（正常会话远小于此）
+    // 上界取 prefix 前缀自增（最后的 ':' 换成 ';'），覆盖 bubbleId:<cid>: 开头的全部 key
+    const rows = db.prepare('SELECT key, value FROM cursorDiskKV WHERE key >= ? AND key < ? LIMIT 5000')
+      .all(`bubbleId:${composerId}:`, `bubbleId:${composerId};`);
+    // 一个 bubbleId = 一轮对话：type 1 是 user 提问（带 text），
+    // type 2 的 /s:N 分片是对这轮的 assistant 回复（独立增量，按序号拼接即全文）
+    const users = new Map<string, { createdAt: number; text: string }>();
+    const replies = new Map<string, { createdAt: number; parts: { seq: number; text: string }[] }>();
+    for (const { key, value } of rows as { key: string; value: Uint8Array }[]) {
+      if (!/^bubbleId:[0-9a-fA-F-]+:[0-9a-fA-F-]+(?:\/s:\d+)?$/.test(key)) continue; // /t:call-* 等工具数据
+      let event: any;
+      try {
+        event = JSON.parse(Buffer.from(value).toString('utf8'));
+      } catch {
+        continue;
+      }
+      const text = typeof event?.text === 'string' ? event.text : '';
+      if (!text.trim()) continue;
+      if (event?.type === 1) {
+        const trimmed = text.trimStart();
+        if (trimmed.startsWith('<user_info>') || trimmed.startsWith('<timestamp>')) continue; // IDE 注入防御
+      }
+      const ts = typeof event?.createdAt === 'string' ? Date.parse(event.createdAt) : NaN;
+      const createdAt = Number.isFinite(ts) ? ts : 0;
+      const bubbleId = key.split(':')[2];
+      const seq = Number(/^.*\/s:(\d+)$/.exec(key)?.[1] ?? -1);
+      if (event?.type === 1) {
+        users.set(bubbleId, { createdAt: createdAt || users.get(bubbleId)?.createdAt || 0, text });
+      } else if (event?.type === 2) {
+        const reply = replies.get(bubbleId) ?? { createdAt: 0, parts: [] };
+        if (createdAt) reply.createdAt = Math.max(reply.createdAt, createdAt);
+        reply.parts.push({ seq, text });
+        replies.set(bubbleId, reply);
+      }
+    }
+    // 两种消息一起按时间排序输出
+    const timed: { createdAt: number; role: 'user' | 'assistant'; text: string }[] = [];
+    for (const [bid, item] of users) timed.push({ createdAt: item.createdAt, role: 'user', text: item.text });
+    for (const [bid, item] of replies) {
+      item.parts.sort((a, b) => a.seq - b.seq);
+      const text = item.parts.map((part) => part.text).join('\n\n');
+      if (text.trim()) timed.push({ createdAt: item.createdAt || users.get(bid)?.createdAt || 0, role: 'assistant', text });
+    }
+    timed.sort((a, b) => a.createdAt - b.createdAt);
+    const messages: AgentSession['messages'] = [];
+    for (const item of timed) pushOrMerge(messages, item.role, item.text, item.createdAt);
+    return messages;
+  } catch {
+    return undefined;
+  } finally {
+    try { db?.close(); } catch { /* 忽略 */ }
+  }
+}
+
+// ---------- pi 官方会话（~/.pi/agent/sessions/<编码cwd>/<ts>_<sessionId>.jsonl） ----------
+
+// pi 的会话文件与 --mode json 输出流同构：message 事件带完整 role + content 数组
+function parsePiJsonl(content: string): AgentSession['messages'] {
+  const messages: AgentSession['messages'] = [];
+  for (const line of content.split('\n')) {
+    if (!line.trim()) continue;
+    let event: any;
+    try {
+      event = JSON.parse(line);
+    } catch {
+      continue;
+    }
+    if (event?.type !== 'message') continue;
+    const message = event?.message;
+    if (!message || (message.role !== 'user' && message.role !== 'assistant')) continue;
+    const ts = typeof event?.timestamp === 'string' ? Date.parse(event.timestamp) : NaN;
+    const createdAt = Number.isFinite(ts) ? ts : 0;
+    let text = '';
+    if (typeof message.content === 'string') text = message.content;
+    else if (Array.isArray(message.content)) {
+      text = message.content
+        .filter((item: any) => item?.type === 'text' && typeof item?.text === 'string')
+        .map((item: any) => item.text)
+        .join('\n\n');
+    }
+    if (!text.trim()) continue;
+    pushOrMerge(messages, message.role, text, createdAt);
+  }
+  return messages;
+}
+
+async function readFileSafe(path: string): Promise<string> {
+  try {
+    return await readFile(path, 'utf8');
+  } catch {
+    return '';
+  }
+}
+
+// 统一消息读取：按 agent 类型分派到对应官方文件解析器。
+// cursor 的 jsonlPath 约定为实例目录（消息在其 store.db 里）。
+async function readAgentMessages(session: StoredAgentSession): Promise<AgentSession['messages'] | undefined> {
+  switch (session.agent) {
+    case 'codex':
+      return readCodexThreadMessages(session.externalId ?? session.sessionId);
+    case 'cursor':
+      if (!session.jsonlPath) return undefined;
+      return session.jsonlPath.endsWith('.vscdb')
+        ? parseCursorIdeMessages(session.jsonlPath, session.sessionId)
+        : parseCursorStore(join(session.jsonlPath, 'store.db'));
+    case 'pi':
+      return session.jsonlPath ? parsePiJsonl(await readFileSafe(session.jsonlPath)) : undefined;
+    default:
+      return session.jsonlPath ? readClaudeMessages(session.jsonlPath) : undefined;
+  }
+}
+
+// 由 Cursor 实例目录组装会话记录（meta.json 提供官方标题 / cwd / 时间）
+async function cursorSessionFromInstance(instanceDir: string, sessionId: string, mtimeMs: number): Promise<StoredAgentSession | undefined> {
+  let meta: any;
+  try {
+    meta = JSON.parse(await readFile(join(instanceDir, 'meta.json'), 'utf8'));
+  } catch {
+    meta = undefined;
+  }
+  const cwd = typeof meta?.cwd === 'string' && meta.cwd ? meta.cwd : undefined;
+  if (!cwd) return undefined;
+  return {
+    sessionId,
+    agent: 'cursor',
+    origin: 'external',
+    externalId: sessionId, // --resume 用实例 uuid
+    title: agentSessionTitle(typeof meta?.title === 'string' ? meta.title : '', sessionId),
+    cwd,
+    state: 'completed',
+    createdAt: typeof meta?.createdAtMs === 'number' ? meta.createdAtMs : mtimeMs,
+    updatedAt: typeof meta?.updatedAtMs === 'number' ? meta.updatedAtMs : mtimeMs,
+    jsonlPath: instanceDir,
+  };
+}
+
+// 发现 Cursor 历史会话：IDE（state.vscdb 的 composerHeaders，通常数千条）与
+// CLI（~/.cursor/chats）两来源合并，按最近活动取最新一批。与其他历史同理：
+// 只在请求列表时动态生成、完全由官方文件决定。jsonlPath 指向 .vscdb 即 IDE 会话、
+// 指向实例目录即 CLI 会话；两者都可被 cursor-agent --resume（按 uuid）。
+async function discoverExternalCursorSessions(): Promise<StoredAgentSession[]> {
+  const found: StoredAgentSession[] = await discoverCursorIdeSessions();
+  found.push(...await discoverCursorCliSessions());
+  found.sort((a, b) => b.updatedAt - a.updatedAt);
+  return found.slice(0, MAX_EXTERNAL_SESSIONS);
+}
+
+// IDE 会话：composerHeaders（排除子 agent 与归档），标题用官方 name
+async function discoverCursorIdeSessions(): Promise<StoredAgentSession[]> {
+  let DatabaseSync: any;
+  try {
+    ({ DatabaseSync } = require('node:sqlite'));
+  } catch {
+    return [];
+  }
+  let db: any;
+  try {
+    db = new DatabaseSync(CURSOR_IDE_DB, { readOnly: true });
+    const rows = db.prepare(
+      'SELECT composerId, createdAt, lastUpdatedAt, value FROM composerHeaders '
+      + 'WHERE isSubagent = 0 AND isArchived = 0 ORDER BY lastUpdatedAt DESC LIMIT ?',
+    ).all(MAX_EXTERNAL_SESSIONS) as { composerId: string; createdAt: number; lastUpdatedAt: number; value: Uint8Array }[];
+    const found: StoredAgentSession[] = [];
+    for (const row of rows) {
+      let name = '';
+      try {
+        const header = JSON.parse(Buffer.from(row.value).toString('utf8'));
+        if (typeof header?.name === 'string') name = header.name;
+      } catch { /* header 解析失败用短 id 兜底 */ }
+      found.push({
+        sessionId: row.composerId,
+        agent: 'cursor',
+        origin: 'external',
+        externalId: row.composerId,
+        title: agentSessionTitle(name, row.composerId),
+        cwd: undefined, // IDE 会话头不带工作目录；resume 不依赖 cwd（云端会话）
+        state: 'completed',
+        createdAt: row.createdAt || row.lastUpdatedAt,
+        updatedAt: row.lastUpdatedAt,
+        jsonlPath: CURSOR_IDE_DB,
+      });
+    }
+    return found;
+  } catch {
+    return []; // IDE 未安装 / 数据库不可读
+  } finally {
+    try { db?.close(); } catch { /* 忽略 */ }
+  }
+}
+
+// CLI 会话：每个 chatId 目录取 mtime 最新的实例作为当前会话状态
+async function discoverCursorCliSessions(): Promise<StoredAgentSession[]> {
+  let chatDirs;
+  try {
+    chatDirs = await readdir(CURSOR_CHATS_DIR, { withFileTypes: true });
+  } catch {
+    return [];
+  }
+  const found: StoredAgentSession[] = [];
+  await Promise.all(chatDirs.filter((d) => d.isDirectory()).map(async (chatDir) => {
+    const chatPath = join(CURSOR_CHATS_DIR, chatDir.name);
+    let instances;
+    try {
+      instances = (await readdir(chatPath, { withFileTypes: true })).filter((d) => d.isDirectory());
+    } catch {
+      return;
+    }
+    let latest: { name: string; mtimeMs: number } | undefined;
+    for (const inst of instances) {
+      try {
+        const st = await stat(join(chatPath, inst.name));
+        if (st.isDirectory() && (!latest || st.mtimeMs > latest.mtimeMs)) latest = { name: inst.name, mtimeMs: st.mtimeMs };
+      } catch { /* 忽略 */ }
+    }
+    if (!latest) return;
+    const session = await cursorSessionFromInstance(join(chatPath, latest.name), latest.name, latest.mtimeMs);
+    if (session) found.push(session);
+  }));
+  return found;
+}
+
+// 由 pi 会话文件组装记录（首行 session 事件带 cwd 原文与时间）
+async function piSessionFromFile(path: string, sessionId: string, mtimeMs: number): Promise<StoredAgentSession | undefined> {
+  const firstLine = readFileHead(path, 4096).split('\n')[0] ?? '';
+  let sessionEvent: any;
+  try {
+    sessionEvent = JSON.parse(firstLine);
+  } catch {
+    return undefined;
+  }
+  if (sessionEvent?.type !== 'session') return undefined;
+  const cwd = typeof sessionEvent.cwd === 'string' && sessionEvent.cwd ? sessionEvent.cwd : undefined;
+  if (!cwd) return undefined;
+  const ts = typeof sessionEvent.timestamp === 'string' ? Date.parse(sessionEvent.timestamp) : NaN;
+  const firstUser = parsePiJsonl(readFileHead(path, 256 * 1024)).find((m) => m.role === 'user');
+  return {
+    sessionId,
+    agent: 'pi',
+    origin: 'external',
+    externalId: sessionId, // --session 用会话 uuid
+    title: agentSessionTitle(firstUser?.content ?? '', sessionId),
+    cwd,
+    state: 'completed',
+    createdAt: Number.isFinite(ts) ? ts : mtimeMs,
+    updatedAt: mtimeMs,
+    jsonlPath: path,
+  };
+}
+
+// 发现 pi 历史会话：扫 <编码cwd>/<ts>_<sessionId>.jsonl，按 mtime 取最新一批
+async function discoverExternalPiSessions(): Promise<StoredAgentSession[]> {
+  let dirs;
+  try {
+    dirs = await readdir(PI_SESSIONS_DIR, { withFileTypes: true });
+  } catch {
+    return [];
+  }
+  const found: StoredAgentSession[] = [];
+  await Promise.all(dirs.filter((d) => d.isDirectory()).map(async (dir) => {
+    let files;
+    try {
+      files = await readdir(join(PI_SESSIONS_DIR, dir.name));
+    } catch {
+      return;
+    }
+    await Promise.all(files.map(async (name) => {
+      const m = /^\d{4}-\d{2}-\d{2}T[0-9.\-]+Z_([0-9a-fA-F-]{8,64})\.jsonl$/.exec(name);
+      if (!m) return;
+      const path = join(PI_SESSIONS_DIR, dir.name, name);
+      try {
+        const st = await stat(path);
+        if (!st.isFile()) return;
+        const session = await piSessionFromFile(path, m[1], st.mtimeMs);
+        if (session) found.push(session);
+      } catch { /* 忽略 */ }
+    }));
+  }));
+  found.sort((a, b) => b.updatedAt - a.updatedAt);
+  return found.slice(0, MAX_EXTERNAL_SESSIONS);
+}
+
+// 定位 Cursor 实例目录（chats/*/<uuid>/）；不校验内部记录，close 回填路径复用
+async function locateCursorInstanceDir(sessionId: string): Promise<string | undefined> {
+  if (!/^[0-9a-fA-F-]{8,64}$/.test(sessionId)) return undefined;
+  let chatDirs;
+  try {
+    chatDirs = await readdir(CURSOR_CHATS_DIR, { withFileTypes: true });
+  } catch {
+    return undefined;
+  }
+  for (const d of chatDirs) {
+    if (!d.isDirectory()) continue;
+    const instanceDir = join(CURSOR_CHATS_DIR, d.name, sessionId);
+    try {
+      const st = await stat(instanceDir);
+      if (st.isDirectory()) return instanceDir;
+    } catch { /* 该 chat 下无此实例，继续 */ }
+  }
+  return undefined;
+}
+
+// 查单个外部 Cursor 会话：先 IDE（composerHeaders 按 composerId 点查）再 CLI（chats/<uuid>/）
+async function findExternalCursorSession(sessionId: string): Promise<StoredAgentSession | undefined> {
+  if (agentSessions.some((item) => item.sessionId === sessionId || item.externalId === sessionId)) return undefined;
+  const ide = await findCursorIdeSession(sessionId);
+  if (ide) return ide;
+  const instanceDir = await locateCursorInstanceDir(sessionId);
+  if (!instanceDir) return undefined;
+  const st = await stat(instanceDir);
+  return cursorSessionFromInstance(instanceDir, sessionId, st.mtimeMs);
+}
+
+// IDE 会话单查（按 ID 恢复 / 拉详情用）
+async function findCursorIdeSession(sessionId: string): Promise<StoredAgentSession | undefined> {
+  let DatabaseSync: any;
+  try {
+    ({ DatabaseSync } = require('node:sqlite'));
+  } catch {
+    return undefined;
+  }
+  let db: any;
+  try {
+    db = new DatabaseSync(CURSOR_IDE_DB, { readOnly: true });
+    const row = db.prepare(
+      'SELECT composerId, createdAt, lastUpdatedAt, value FROM composerHeaders '
+      + 'WHERE composerId = ? AND isSubagent = 0 AND isArchived = 0',
+    ).get(sessionId) as { composerId: string; createdAt: number; lastUpdatedAt: number; value: Uint8Array } | undefined;
+    if (!row) return undefined;
+    let name = '';
+    try {
+      const header = JSON.parse(Buffer.from(row.value).toString('utf8'));
+      if (typeof header?.name === 'string') name = header.name;
+    } catch { /* 短 id 兜底 */ }
+    return {
+      sessionId: row.composerId,
+      agent: 'cursor',
+      origin: 'external',
+      externalId: row.composerId,
+      title: agentSessionTitle(name, row.composerId),
+      cwd: undefined,
+      state: 'completed',
+      createdAt: row.createdAt || row.lastUpdatedAt,
+      updatedAt: row.lastUpdatedAt,
+      jsonlPath: CURSOR_IDE_DB,
+    };
+  } catch {
+    return undefined;
+  } finally {
+    try { db?.close(); } catch { /* 忽略 */ }
+  }
+}
+
+// 定位 pi 会话文件（sessions/*/*_<uuid>.jsonl）；不校验内部记录，close 回填路径复用
+async function locatePiSessionFile(sessionId: string): Promise<string | undefined> {
+  if (!/^[0-9a-fA-F-]{8,64}$/.test(sessionId)) return undefined;
+  let dirs;
+  try {
+    dirs = await readdir(PI_SESSIONS_DIR, { withFileTypes: true });
+  } catch {
+    return undefined;
+  }
+  for (const d of dirs) {
+    if (!d.isDirectory()) continue;
+    try {
+      const names = await readdir(join(PI_SESSIONS_DIR, d.name));
+      const hit = names.find((name) => name.endsWith(`_${sessionId}.jsonl`));
+      if (hit) return join(PI_SESSIONS_DIR, d.name, hit);
+    } catch { /* 目录不可读，继续 */ }
+  }
+  return undefined;
+}
+
+// 查单个外部 pi 会话：按会话 uuid 定位（sessions/*/*_<uuid>.jsonl）
+async function findExternalPiSession(sessionId: string): Promise<StoredAgentSession | undefined> {
+  if (agentSessions.some((item) => item.sessionId === sessionId || item.externalId === sessionId)) return undefined;
+  const path = await locatePiSessionFile(sessionId);
+  if (!path) return undefined;
+  const st = await stat(path);
+  if (!st.isFile()) return undefined;
+  return piSessionFromFile(path, sessionId, st.mtimeMs);
+}
+
 // 发现 Codex 历史会话：以磁盘上的官方 rollout 为准，按 thread 聚合、mtime 取最新一批。
 // 与 Claude 历史同理：只在请求列表时动态生成、不写入 claude-sessions.json、回复不改变此列表。
 async function discoverExternalCodexSessions(): Promise<StoredAgentSession[]> {
@@ -1020,9 +1475,12 @@ async function findExternalCodexSession(threadId: string): Promise<StoredAgentSe
   }
 }
 
-// 按会话 ID 查外部会话（claude 与 codex 的 id 均为 uuid 形态、无法从形态区分，顺序查找）
+// 按会话 ID 查外部会话（各 CLI 的 id 均为 uuid/hex 形态、无法从形态区分，顺序查找）
 async function findExternalAgentSession(sessionId: string): Promise<StoredAgentSession | undefined> {
-  return (await findExternalClaudeSession(sessionId)) ?? (await findExternalCodexSession(sessionId));
+  return (await findExternalClaudeSession(sessionId))
+    ?? (await findExternalCodexSession(sessionId))
+    ?? (await findExternalCursorSession(sessionId))
+    ?? (await findExternalPiSession(sessionId));
 }
 
 function replyAgent(reqId: string, targetId: string, sessions: AgentSession[]) {
@@ -1036,6 +1494,8 @@ function handleAgentList(msg: AgentListMsg) {
     let list: StoredAgentSession[];
     if (msg.scope === 'claudeHistory') list = await discoverExternalClaudeSessions();
     else if (msg.scope === 'codexHistory') list = await discoverExternalCodexSessions();
+    else if (msg.scope === 'cursorHistory') list = await discoverExternalCursorSessions();
+    else if (msg.scope === 'piHistory') list = await discoverExternalPiSessions();
     else list = [...agentSessions].sort((a, b) => b.updatedAt - a.updatedAt);
     replyAgent(msg.reqId, msg.targetId, list.map(summarySnapshot));
   })();
@@ -1076,7 +1536,7 @@ async function handleAgentRun(msg: AgentRunMsg) {
     session = await findExternalAgentSession(msg.sessionId);
     if (session) {
       agentSessions.push(session);
-      console.log(`[agent] 导入外部${session.agent === 'codex' ? ' Codex' : ' Claude Code'} 会话 ${session.sessionId} (cwd: ${session.cwd})`);
+      console.log(`[agent] 导入外部${session.agent === 'codex' ? ' Codex' : session.agent === 'cursor' ? ' Cursor' : session.agent === 'pi' ? ' Pi' : ' Claude Code'} 会话 ${session.sessionId} (cwd: ${session.cwd})`);
     }
   }
   if (msg.sessionId && !session) {
@@ -1123,10 +1583,8 @@ async function handleAgentRun(msg: AgentRunMsg) {
   if (kind !== 'codex' && !session.jsonlPath) {
     session.jsonlPath = claudeJsonlPath(session.cwd, session.sessionId);
   }
-  // 运行期间的内存视图基线：官方文件已解析的内容（codex 旧记录无 rollout 时用曾维护的副本兜底）
-  const base = kind === 'codex'
-    ? (await readCodexThreadMessages(session.externalId ?? session.sessionId)) ?? session.messages
-    : session.jsonlPath ? await readClaudeMessages(session.jsonlPath) : undefined;
+  // 运行期间的内存视图基线：官方文件已解析的内容（旧记录无官方文件时用曾维护的副本兜底）
+  const base = (await readAgentMessages(session)) ?? session.messages;
   activeRuns.set(session.sessionId, { baseMessages: JSON.parse(JSON.stringify(base ?? [])), prompt, streamedText: '' });
   persistAgentSessions().catch((err) => console.error(`[agent] 保存会话失败: ${err.message}`));
   // 立即回 running 快照；网络中断时控制端可稍后用 agent-status / agent-list 拉取最终结果。
@@ -1141,6 +1599,17 @@ async function handleAgentRun(msg: AgentRunMsg) {
     args = ['exec', '--json', '--skip-git-repo-check', '--dangerously-bypass-approvals-and-sandbox'];
     if (msg.sessionId && session.externalId) args.push('resume', session.externalId);
     args.push(prompt);
+  } else if (kind === 'cursor') {
+    // cursor-agent 的 stream-json 与 claude 同构；-f 跳过逐次权限确认（无人交互界面）。
+    // 会话 id（--resume 用）无法预指定，从 init 事件的 session_id 获取。
+    file = 'cursor-agent';
+    args = ['-p', prompt, '--output-format', 'stream-json', '--stream-partial-output', '-f'];
+    if (msg.sessionId && session.externalId) args.push('--resume', session.externalId);
+  } else if (kind === 'pi') {
+    // pi -p --mode json 输出 JSONL 事件；会话 id 从首行 session 事件获取，继续会话用 --session。
+    file = 'pi';
+    args = ['-p', prompt, '--mode', 'json'];
+    if (msg.sessionId && session.externalId) args.push('--session', session.externalId);
   } else {
     // include-partial-messages 才会在 stream-json 中输出 token 级 text_delta；否则通常只会收到结束结果。
     file = 'claude';
@@ -1148,7 +1617,7 @@ async function handleAgentRun(msg: AgentRunMsg) {
     if (msg.sessionId) args.push('--resume', session.sessionId);
     else args.push('--session-id', session.sessionId);
   }
-  console.log(`[agent] ${msg.sessionId ? '继续' : '新建'}${kind === 'codex' ? ' Codex' : ' Claude Code'} 会话 ${session.sessionId}${session.cwd ? ` (cwd: ${session.cwd})` : ''}`);
+  console.log(`[agent] ${msg.sessionId ? '继续' : '新建'}${kind === 'codex' ? ' Codex' : kind === 'cursor' ? ' Cursor' : kind === 'pi' ? ' Pi' : ' Claude Code'} 会话 ${session.sessionId}${session.cwd ? ` (cwd: ${session.cwd})` : ''}`);
   const child = spawn(file, args, { cwd: session.cwd || undefined, env: process.env, stdio: ['ignore', 'pipe', 'pipe'] });
   agentProcesses.set(session.sessionId, child);
   let stdout = '';
@@ -1165,6 +1634,60 @@ async function handleAgentRun(msg: AgentRunMsg) {
     if (!line.trim()) return;
     try {
       const event = JSON.parse(line);
+      if (kind === 'cursor') {
+        if (event?.type === 'system' && event?.subtype === 'init' && typeof event?.session_id === 'string') {
+          // 与 codex 的 thread.started 同理：尽早记录会话 id（--resume 用）
+          if (session!.externalId !== event.session_id) {
+            session!.externalId = event.session_id;
+            session!.updatedAt = Date.now();
+            persistAgentSessions().catch((err) => console.error(`[agent] 保存会话失败: ${err.message}`));
+          }
+        } else if (event?.type === 'assistant' && Array.isArray(event?.message?.content)) {
+          // 带 timestamp_ms 的是增量 delta，不带的是整条完整消息（取 text 部分拼接）
+          const text = event.message.content
+            .filter((item: any) => item?.type === 'text' && typeof item?.text === 'string')
+            .map((item: any) => item.text)
+            .join('\n\n');
+          if (!text) return;
+          if (typeof event?.timestamp_ms === 'number') {
+            const run = activeRuns.get(session!.sessionId);
+            if (run) run.streamedText += text;
+            streamedText += text;
+            publishStream();
+          } else if (!streamedText) {
+            // 无增量时（未开 partial 的整条输出）一次成条
+            const run = activeRuns.get(session!.sessionId);
+            if (run) run.streamedText += text;
+            streamedText += text;
+            publishStream();
+          }
+        }
+        return;
+      }
+      if (kind === 'pi') {
+        if (event?.type === 'session' && typeof event?.id === 'string') {
+          if (session!.externalId !== event.id) {
+            session!.externalId = event.id;
+            session!.updatedAt = Date.now();
+            persistAgentSessions().catch((err) => console.error(`[agent] 保存会话失败: ${err.message}`));
+          }
+        } else if (event?.type === 'message_end' && event?.message?.role === 'assistant' && Array.isArray(event?.message?.content)) {
+          // message_end 携带整条消息（无 token 级增量），一次成条
+          const text = event.message.content
+            .filter((item: any) => item?.type === 'text' && typeof item?.text === 'string')
+            .map((item: any) => item.text)
+            .join('\n\n');
+          if (text) {
+            const run = activeRuns.get(session!.sessionId);
+            if (run) run.streamedText += text;
+            streamedText += text;
+            publishStream();
+          }
+        } else if (event?.type === 'agent_settled' && !event?.aborted) {
+          turnCompleted = true;
+        }
+        return;
+      }
       if (kind === 'codex') {
         if (event?.type === 'thread.started' && typeof event.thread_id === 'string') {
           // resume 与新建都会下发 thread.started；尽早落盘，client 中途被杀后仍可恢复
@@ -1211,7 +1734,11 @@ async function handleAgentRun(msg: AgentRunMsg) {
     if (err.message.includes('ENOENT')) {
       stderr += kind === 'codex'
         ? '未找到 codex 命令，请确认云电脑已安装 Codex CLI 且已登录。'
-        : '未找到 claude 命令，请确认云电脑已安装 Claude Code CLI 且已登录。';
+        : kind === 'cursor'
+          ? '未找到 cursor-agent 命令，请确认云电脑已安装 Cursor Agent 且已登录。'
+          : kind === 'pi'
+            ? '未找到 pi 命令，请确认云电脑已安装 pi 且已登录。'
+            : '未找到 claude 命令，请确认云电脑已安装 Claude Code CLI 且已登录。';
     }
   });
   child.on('close', async (code) => {
@@ -1219,10 +1746,10 @@ async function handleAgentRun(msg: AgentRunMsg) {
     const finished = Date.now();
     if (streamBuffer) consumeStreamLine(streamBuffer);
     let result = '';
-    // claude stream-json 的最终 result 事件带完整结果；仅在未收到文本增量时作为回退，避免重复展示。
+    // claude / cursor 的 stream-json 最终 result 事件带完整结果；仅在未收到文本增量时作为回退，避免重复展示。
     let resultReported = false; // 是否收到 stream-json 的最终 result 事件（CLI 正常走完输出阶段）
     let resultIsError = false; // result 事件自身标记的错误
-    if (kind !== 'codex') {
+    if (kind === 'claude' || kind === 'cursor') {
       for (const line of stdout.split(/\r?\n/)) {
         try {
           const event = JSON.parse(line);
@@ -1238,32 +1765,34 @@ async function handleAgentRun(msg: AgentRunMsg) {
       }
     }
     session!.updatedAt = finished;
-    // codex 的 stderr 可能带无害运行提示（如工作目录提示），以 turn.completed 为准判成功；
-    // claude 的 stderr 同样常有无害噪音（stdin 提示、代理模型名告警），收到 result 事件时以它为准，
+    // codex / pi 的 stderr 可能带无害运行提示，以收到结束事件（turn.completed / agent_settled）为准；
+    // claude / cursor 的 stderr 同样常有无害噪音（stdin 提示、代理模型名告警），收到 result 事件时以它为准，
     // 仅在 CLI 未走到输出阶段（无 result）时才用 stderr / 退出码兜底判失败。
-    const ok = code === 0 && (kind === 'codex'
-      ? turnCompleted || !stderr
-      : resultReported ? !resultIsError : !stderr);
+    const hasResultEvent = kind === 'claude' || kind === 'cursor';
+    const ok = code === 0 && (hasResultEvent
+      ? resultReported ? !resultIsError : !stderr
+      : turnCompleted || !stderr);
     if (ok) {
       session!.state = 'completed';
     } else {
       session!.state = 'failed';
-      session!.error = stderr.trim() || `${kind === 'codex' ? 'Codex' : 'Claude Code'} 退出码 ${code ?? '未知'}`;
+      session!.error = stderr.trim() || `${kind === 'codex' ? 'Codex' : kind === 'cursor' ? 'Cursor' : kind === 'pi' ? 'Pi' : 'Claude Code'} 退出码 ${code ?? '未知'}`;
     }
-    // 最终消息以官方会话文件为准（claude jsonl / codex 全分片 rollout）；codex 的 rollout
-    // 此刻才可定位（文件名含时间戳），按 thread id 找全分片、jsonlPath 回填最新一个。
+    // 最终消息以官方会话文件为准；各 CLI 的会话文件路径此刻才可定位
+    // （codex 文件名含时间戳、cursor 的实例目录与 pi 的会话文件均按会话 id 反查），逐一回填。
     // 若文件缺失或尚未包含本轮输入（CLI 启动失败 / 落盘延迟），
     // 回退用本轮运行视图组装，保证控制端不丢本次对话。
-    if (kind === 'codex' && session!.externalId) {
-      const paths = await findCodexAllRollouts(session!.externalId);
-      if (paths.length > 0) session!.jsonlPath = paths[paths.length - 1];
+    if (session!.externalId) {
+      if (kind === 'codex') {
+        const paths = await findCodexAllRollouts(session!.externalId);
+        if (paths.length > 0) session!.jsonlPath = paths[paths.length - 1];
+      } else if (kind === 'cursor' && !session!.jsonlPath) {
+        session!.jsonlPath = await locateCursorInstanceDir(session!.externalId);
+      } else if (kind === 'pi' && !session!.jsonlPath) {
+        session!.jsonlPath = await locatePiSessionFile(session!.externalId);
+      }
     }
-    let finalMessages: AgentSession['messages'] | undefined;
-    if (kind === 'codex') {
-      finalMessages = await readCodexThreadMessages(session!.externalId ?? session!.sessionId);
-    } else if (session!.jsonlPath) {
-      finalMessages = await readClaudeMessages(session!.jsonlPath);
-    }
+    let finalMessages: AgentSession['messages'] | undefined = await readAgentMessages(session!);
     const run = activeRuns.get(session!.sessionId);
     if (run && (finalMessages === undefined || !finalMessages.some((item) => item.role === 'user' && item.content === run.prompt))) {
       const replyText = run.streamedText || result;
