@@ -3,6 +3,7 @@ import { WebSocketServer, WebSocket } from 'ws';
 import http from 'node:http';
 import https from 'node:https';
 import { spawn, type ChildProcess } from 'node:child_process';
+import { statSync } from 'node:fs';
 import { existsSync, readFileSync, writeFileSync, renameSync, createReadStream } from 'node:fs';
 import type { Stats } from 'node:fs';
 import { readFile, writeFile, rm, mkdir, readdir, stat } from 'node:fs/promises';
@@ -154,6 +155,20 @@ async function serverFileList(ws: WebSocket, msg: any) {
   } catch (err: any) {
     serverReply(ws, msg, { type: 'file-listing', path: target, error: err.message });
   }
+}
+
+// @server：读取服务器本机图片为 data URL（与 client 的 file-image 行为一致）
+function serverFileImage(ws: WebSocket, msg: any) {
+  console.log(`[file-image] @server ${msg.path}`);
+  const reply = (payload: Record<string, unknown>) => send(ws, { reqId: msg.reqId, targetId: SERVER_TARGET, ...payload } as AnyMsg);
+  readFile(msg.path).then((data) => {
+    const st = statSync(msg.path);
+    if (!st.isFile()) throw new Error('不是普通文件，无法查看');
+    if (st.size > 20 * 1024 * 1024) throw new Error(`图片超过 20MB（${st.size} 字节），请使用下载`);
+    const ext = String(msg.path).split('.').pop()?.toLowerCase() ?? '';
+    const mime = ({ png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg', gif: 'image/gif', webp: 'image/webp', bmp: 'image/bmp', heic: 'image/heic', heif: 'image/heif', avif: 'image/avif', ico: 'image/x-icon' } as Record<string, string>)[ext] ?? 'image/png';
+    reply({ type: 'file-image-content', path: msg.path, dataUrl: `data:${mime};base64,${data.toString('base64')}` });
+  }).catch((err: any) => reply({ type: 'file-image-content', path: msg.path, error: err.message }));
 }
 
 async function serverFileRead(ws: WebSocket, msg: any) {
@@ -509,6 +524,7 @@ function onConnection(ws: WebSocket) {
         }
         switch (msg.type) {
           case 'file-list': return serverFileList(ws, m);
+          case 'file-image': return serverFileImage(ws, m);
           case 'file-read': return serverFileRead(ws, m);
           case 'file-write': return serverFileWrite(ws, m);
           case 'file-create': return serverFileCreate(ws, m);
@@ -530,7 +546,7 @@ function onConnection(ws: WebSocket) {
 
     // client -> controller：响应广播给所有 controller，各自按 reqId 过滤。
     // 只放行指令响应类消息，防止 client 伪造 clients / whitelist 等服务端消息
-    const CLIENT_RESPONSE_TYPES = new Set(['exec-output', 'exec-exit', 'file-content', 'file-listing', 'done', 'error', 'file-download-data', 'agent-sessions', 'projects', 'terminal-commands']);
+    const CLIENT_RESPONSE_TYPES = new Set(['exec-output', 'exec-exit', 'file-content', 'file-listing', 'done', 'error', 'file-download-data', 'file-image-content', 'agent-sessions', 'projects', 'terminal-commands']);
     if (role === 'client' && msg.type !== 'register') {
       if (!CLIENT_RESPONSE_TYPES.has(msg.type)) return;
       for (const c of controllers) send(c, msg);

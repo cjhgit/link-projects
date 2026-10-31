@@ -4,6 +4,7 @@ import SwiftUI
 struct AgentView: View {
     let session: LinkSession
     var initialCwd: String? = nil // 项目页「新建会话」跳转时预填的工作目录
+    var projectCwd: String? = nil // 项目详情里传入：各 tab 只显示该项目的会话
     @State private var sessions: [AgentSessionInfo] = []
     @State private var selectedId: String?
     @State private var creating = false
@@ -99,7 +100,8 @@ struct AgentView: View {
                     selectedId = nil
                     creating = true
                     prompt = ""
-                    cwd = ""
+                    // 项目详情里新建会话：默认以项目目录为工作目录（可修改）
+                    cwd = projectCwd ?? ""
                 } label: { Label("新建会话", systemImage: "plus") }
                 Button {
                     resumeId = ""
@@ -271,6 +273,9 @@ struct AgentView: View {
                             .font(.caption).foregroundStyle(.secondary)
                     }
                     sessionIdRow(selected)
+                    Text("创建 \(Self.timeText(selected.createdAt)) · 更新 \(Self.timeText(selected.updatedAt))")
+                        .font(.caption2)
+                        .foregroundStyle(.tertiary)
                     if isResponding {
                         HStack(spacing: 8) {
                             ProgressView().controlSize(.small)
@@ -343,9 +348,13 @@ struct AgentView: View {
         cwd = initialCwd
     }
 
+    private static func timeText(_ ms: Double) -> String {
+        Date(timeIntervalSince1970: ms / 1000).formatted(date: .abbreviated, time: .shortened)
+    }
+
     private func refresh(_ targetId: String) {
         loading = true
-        session.listAgentSessions(targetId: targetId, scope: scope) { result in
+        session.listAgentSessions(targetId: targetId, scope: scope, cwd: projectCwd) { result in
             loading = false; sessions = result
             if selectedId != nil, !result.contains(where: { $0.id == selectedId }) { selectedId = nil; creating = false }
             else if selectedId != nil { loadDetail(targetId) } // 摘要覆盖了消息，重新拉详情

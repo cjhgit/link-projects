@@ -13,6 +13,7 @@ import {
   closeSync,
   writeSync,
   readSync,
+  fstatSync,
 } from 'node:fs';
 import { dirname, join } from 'node:path';
 import type {
@@ -22,6 +23,7 @@ import type {
   FileCreateMsg,
   FileDeleteMsg,
   FileListMsg,
+  FileImageMsg,
   FileReadMsg,
   FileWriteMsg,
   FileUploadStartMsg,
@@ -355,6 +357,8 @@ function connect() {
         return handleFileDelete(msg as FileDeleteMsg);
       case 'file-list':
         return handleFileList(msg as FileListMsg);
+      case 'file-image':
+        return handleFileImage(msg as FileImageMsg);
       case 'file-upload-start':
         return handleFileUploadStart(msg as FileUploadStartMsg);
       case 'file-upload-chunk':
@@ -833,6 +837,30 @@ function externalSessionFromHistory(sessionId: string, entry: ClaudeHistoryEntry
   };
 }
 
+// 读取文件尾部若干字节（取最后活动时间用）
+function readFileTail(path: string, bytes: number): string {
+  const fd = openSync(path, 'r');
+  try {
+    const st = fstatSync(fd);
+    const start = Math.max(0, st.size - bytes);
+    const buf = Buffer.alloc(st.size - start);
+    readSync(fd, buf, 0, buf.length, start);
+    return buf.toString('utf8');
+  } finally {
+    closeSync(fd);
+  }
+}
+
+// 从文本中提取最后一个 ISO timestamp（claude / codex / pi 的事件行都带）；
+// 文件 mtime 会被 CLI 后台任务（compact 等）批量重写，排序与「更新时间」以内容时间为准
+function lastTimestampFromTail(tail: string): number | undefined {
+  const matches = tail.match(/"timestamp"\s*:\s*"([^"]+)"/g);
+  if (!matches || matches.length === 0) return undefined;
+  const last = matches[matches.length - 1].match(/"([^"]+)"$/)?.[1] ?? '';
+  const ms = Date.parse(last);
+  return Number.isFinite(ms) ? ms : undefined;
+}
+
 // 从 jsonl 头部文本中取第一个带 cwd 的事件行（官方会话几乎每个事件行都带 cwd）
 function firstCwdFromHead(head: string): string | undefined {
   for (const line of head.split('\n')) {
@@ -848,12 +876,22 @@ function firstCwdFromHead(head: string): string | undefined {
 // 含 -p 模式发起、history.jsonl 未收录的会话；history.jsonl 仅用于补标题（会话第一句输入）。
 // 只在请求列表时动态生成，不写入 claude-sessions.json；回复不改变此列表
 // （回复后 jsonl 更新，仅排序随之变化），跟踪运行状态的内部记录归「会话」页。
-async function discoverExternalClaudeSessions(): Promise<StoredAgentSession[]> {
+async function discoverExternalClaudeSessions(projectCwd?: string): Promise<StoredAgentSession[]> {
   let dirs;
-  try {
-    dirs = await readdir(CLAUDE_PROJECTS_DIR, { withFileTypes: true });
-  } catch {
-    return [];
+  if (projectCwd) {
+    // 项目过滤：官方目录名由 cwd 编码而来，直接定位单目录（再按内容 cwd 精确匹配防编码歧义）
+    try {
+      await stat(join(CLAUDE_PROJECTS_DIR, claudeProjectDirName(projectCwd)));
+      dirs = [{ name: claudeProjectDirName(projectCwd), isDirectory: () => true } as any];
+    } catch {
+      return [];
+    }
+  } else {
+    try {
+      dirs = await readdir(CLAUDE_PROJECTS_DIR, { withFileTypes: true });
+    } catch {
+      return [];
+    }
   }
   // 完全由磁盘上的官方 jsonl 决定（含本软件发起的）；与「会话」页可能重复出现是预期
   // 先收集全部候选文件按 mtime 排序，只对最近的一批读头部解析，不为老会话做文件 IO
@@ -880,6 +918,7 @@ async function discoverExternalClaudeSessions(): Promise<StoredAgentSession[]> {
     const head = readFileHead(item.path, 64 * 1024);
     const cwd = firstCwdFromHead(head);
     if (!cwd) return undefined; // 恢复对话依赖 cwd 定位官方会话文件
+    if (projectCwd && cwd !== projectCwd) return undefined; // 项目过滤：按内容 cwd 精确匹配
     const entry = history.get(item.sessionId);
     const title = entry?.display
       ? agentSessionTitle(entry.display, item.sessionId)
@@ -892,11 +931,13 @@ async function discoverExternalClaudeSessions(): Promise<StoredAgentSession[]> {
       cwd,
       state: 'completed',
       createdAt: entry?.timestamp || item.mtimeMs,
-      updatedAt: item.mtimeMs,
+      updatedAt: lastTimestampFromTail(readFileTail(item.path, 8 * 1024)) ?? item.mtimeMs,
       jsonlPath: item.path,
     } as StoredAgentSession;
   }));
-  return found.filter((item): item is StoredAgentSession => item !== undefined);
+  const sessions = found.filter((item): item is StoredAgentSession => item !== undefined);
+  sessions.sort((a, b) => b.updatedAt - a.updatedAt); // mtime 可能被后台任务批量污染，按内容时间重排
+  return sessions;
 }
 
 // 读取文件头部若干字节（找 cwd / 首条用户输入用，避免为定位元信息读完整大文件）
@@ -1171,9 +1212,10 @@ async function cursorSessionFromInstance(instanceDir: string, sessionId: string,
 // CLI（~/.cursor/chats）两来源合并，按最近活动取最新一批。与其他历史同理：
 // 只在请求列表时动态生成、完全由官方文件决定。jsonlPath 指向 .vscdb 即 IDE 会话、
 // 指向实例目录即 CLI 会话；两者都可被 cursor-agent --resume（按 uuid）。
-async function discoverExternalCursorSessions(): Promise<StoredAgentSession[]> {
-  const found: StoredAgentSession[] = await discoverCursorIdeSessions();
-  found.push(...await discoverCursorCliSessions());
+async function discoverExternalCursorSessions(projectCwd?: string): Promise<StoredAgentSession[]> {
+  // IDE 会话（state.vscdb）头里没有工作目录、无法归属项目，项目过滤时不返回
+  const found: StoredAgentSession[] = projectCwd ? [] : await discoverCursorIdeSessions();
+  found.push(...await discoverCursorCliSessions(projectCwd));
   found.sort((a, b) => b.updatedAt - a.updatedAt);
   return found.slice(0, MAX_EXTERNAL_SESSIONS);
 }
@@ -1222,7 +1264,7 @@ async function discoverCursorIdeSessions(): Promise<StoredAgentSession[]> {
 }
 
 // CLI 会话：每个 chatId 目录取 mtime 最新的实例作为当前会话状态
-async function discoverCursorCliSessions(): Promise<StoredAgentSession[]> {
+async function discoverCursorCliSessions(projectCwd?: string): Promise<StoredAgentSession[]> {
   let chatDirs;
   try {
     chatDirs = await readdir(CURSOR_CHATS_DIR, { withFileTypes: true });
@@ -1247,13 +1289,13 @@ async function discoverCursorCliSessions(): Promise<StoredAgentSession[]> {
     }
     if (!latest) return;
     const session = await cursorSessionFromInstance(join(chatPath, latest.name), latest.name, latest.mtimeMs);
-    if (session) found.push(session);
+    if (session && (!projectCwd || session.cwd === projectCwd)) found.push(session);
   }));
   return found;
 }
 
 // 由 pi 会话文件组装记录（首行 session 事件带 cwd 原文与时间）
-async function piSessionFromFile(path: string, sessionId: string, mtimeMs: number): Promise<StoredAgentSession | undefined> {
+async function piSessionFromFile(path: string, sessionId: string, mtimeMs: number, projectPiCwd?: string): Promise<StoredAgentSession | undefined> {
   const firstLine = readFileHead(path, 4096).split('\n')[0] ?? '';
   let sessionEvent: any;
   try {
@@ -1264,6 +1306,7 @@ async function piSessionFromFile(path: string, sessionId: string, mtimeMs: numbe
   if (sessionEvent?.type !== 'session') return undefined;
   const cwd = typeof sessionEvent.cwd === 'string' && sessionEvent.cwd ? sessionEvent.cwd : undefined;
   if (!cwd) return undefined;
+  if (projectPiCwd && cwd !== projectPiCwd) return undefined; // 项目过滤
   const ts = typeof sessionEvent.timestamp === 'string' ? Date.parse(sessionEvent.timestamp) : NaN;
   const firstUser = parsePiJsonl(readFileHead(path, 256 * 1024)).find((m) => m.role === 'user');
   return {
@@ -1275,13 +1318,13 @@ async function piSessionFromFile(path: string, sessionId: string, mtimeMs: numbe
     cwd,
     state: 'completed',
     createdAt: Number.isFinite(ts) ? ts : mtimeMs,
-    updatedAt: mtimeMs,
+    updatedAt: lastTimestampFromTail(readFileTail(path, 8 * 1024)) ?? mtimeMs,
     jsonlPath: path,
   };
 }
 
 // 发现 pi 历史会话：扫 <编码cwd>/<ts>_<sessionId>.jsonl，按 mtime 取最新一批
-async function discoverExternalPiSessions(): Promise<StoredAgentSession[]> {
+async function discoverExternalPiSessions(projectCwd?: string): Promise<StoredAgentSession[]> {
   let dirs;
   try {
     dirs = await readdir(PI_SESSIONS_DIR, { withFileTypes: true });
@@ -1303,7 +1346,7 @@ async function discoverExternalPiSessions(): Promise<StoredAgentSession[]> {
       try {
         const st = await stat(path);
         if (!st.isFile()) return;
-        const session = await piSessionFromFile(path, m[1], st.mtimeMs);
+        const session = await piSessionFromFile(path, m[1], st.mtimeMs, projectCwd);
         if (session) found.push(session);
       } catch { /* 忽略 */ }
     }));
@@ -1415,7 +1458,7 @@ async function findExternalPiSession(sessionId: string): Promise<StoredAgentSess
 
 // 发现 Codex 历史会话：以磁盘上的官方 rollout 为准，按 thread 聚合、mtime 取最新一批。
 // 与 Claude 历史同理：只在请求列表时动态生成、不写入 claude-sessions.json、回复不改变此列表。
-async function discoverExternalCodexSessions(): Promise<StoredAgentSession[]> {
+async function discoverExternalCodexSessions(projectCwd?: string): Promise<StoredAgentSession[]> {
   // 完全由磁盘上的官方 rollout 决定（含本软件发起、以及继续过对话的），
   // 与「会话」页可能重复出现是预期：历史只看官方文件，不管会话由谁发起
   const threads = await listCodexThreadFiles(MAX_EXTERNAL_SESSIONS);
@@ -1424,6 +1467,7 @@ async function discoverExternalCodexSessions(): Promise<StoredAgentSession[]> {
     const head = readFileHead(item.oldest, 256 * 1024);
     const cwd = codexCwdFromHead(head);
     if (!cwd) return undefined; // 恢复对话依赖 cwd 定位工作目录
+    if (projectCwd && cwd !== projectCwd) return undefined; // 项目过滤
     let firstUser = parseCodexJsonl(head).find((m) => m.role === 'user');
     if (!firstUser && item.newest !== item.oldest) {
       // 最老分片头部只有长篇注入指令（如 AGENTS.md）时，取最新分片的首条输入做标题
@@ -1439,11 +1483,13 @@ async function discoverExternalCodexSessions(): Promise<StoredAgentSession[]> {
       cwd,
       state: 'completed',
       createdAt: item.mtimeMs,
-      updatedAt: item.mtimeMs,
+      updatedAt: lastTimestampFromTail(readFileTail(item.newest, 8 * 1024)) ?? item.mtimeMs,
       jsonlPath: item.newest,
     } as StoredAgentSession;
   }));
-  return found.filter((item): item is StoredAgentSession => item !== undefined);
+  const sessions = found.filter((item): item is StoredAgentSession => item !== undefined);
+  sessions.sort((a, b) => b.updatedAt - a.updatedAt);
+  return sessions;
 }
 
 // 查单个外部 Codex 会话：按 threadId 定位全部分片后组装记录
@@ -1491,12 +1537,17 @@ function handleAgentList(msg: AgentListMsg) {
   // 最近更新的排在前面；列表不依赖 controller 保留任何状态。
   void (async () => {
     // 历史 tab：完全由官方会话文件决定；默认 tab：本软件的会话记录（含从历史导入并继续过的）
+    const projectCwd = msg.cwd?.trim() || undefined;
     let list: StoredAgentSession[];
-    if (msg.scope === 'claudeHistory') list = await discoverExternalClaudeSessions();
-    else if (msg.scope === 'codexHistory') list = await discoverExternalCodexSessions();
-    else if (msg.scope === 'cursorHistory') list = await discoverExternalCursorSessions();
-    else if (msg.scope === 'piHistory') list = await discoverExternalPiSessions();
-    else list = [...agentSessions].sort((a, b) => b.updatedAt - a.updatedAt);
+    if (msg.scope === 'claudeHistory') list = await discoverExternalClaudeSessions(projectCwd);
+    else if (msg.scope === 'codexHistory') list = await discoverExternalCodexSessions(projectCwd);
+    else if (msg.scope === 'cursorHistory') list = await discoverExternalCursorSessions(projectCwd);
+    else if (msg.scope === 'piHistory') list = await discoverExternalPiSessions(projectCwd);
+    else {
+      list = [...agentSessions].sort((a, b) => b.updatedAt - a.updatedAt);
+      // 项目详情里只看该项目的会话
+      if (projectCwd) list = list.filter((item) => item.cwd === projectCwd);
+    }
     replyAgent(msg.reqId, msg.targetId, list.map(summarySnapshot));
   })();
 }
@@ -1976,6 +2027,31 @@ async function handleFileWrite(msg: FileWriteMsg) {
     reply({ type: 'done', reqId: msg.reqId, targetId: msg.targetId, ok: true });
   } catch (err: any) {
     reply({ type: 'done', reqId: msg.reqId, targetId: msg.targetId, ok: false, error: err.message });
+  }
+}
+
+// 常见图片扩展名 -> MIME（data URL 用；未知扩展名按 png 猜，端上按数据解码）
+const IMAGE_MIME_BY_EXT: Record<string, string> = {
+  png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg', gif: 'image/gif',
+  webp: 'image/webp', bmp: 'image/bmp', heic: 'image/heic', heif: 'image/heif', avif: 'image/avif', ico: 'image/x-icon',
+};
+
+// 读取图片文件为 data URL 一次性返回（远端图片通常不大；超过 20MB 拒绝，走下载通道）
+async function handleFileImage(msg: FileImageMsg) {
+  console.log(`[file-image] ${msg.path}`);
+  try {
+    const st = await stat(msg.path);
+    if (!st.isFile()) throw new Error('不是普通文件，无法查看');
+    if (st.size > 20 * 1024 * 1024) throw new Error(`图片超过 20MB（${st.size} 字节），请使用下载`);
+    const ext = msg.path.split('.').pop()?.toLowerCase() ?? '';
+    const mime = IMAGE_MIME_BY_EXT[ext] ?? 'image/png';
+    const data = await readFile(msg.path);
+    reply({
+      type: 'file-image-content', reqId: msg.reqId, targetId: msg.targetId, path: msg.path,
+      dataUrl: `data:${mime};base64,${data.toString('base64')}`,
+    });
+  } catch (err: any) {
+    reply({ type: 'file-image-content', reqId: msg.reqId, targetId: msg.targetId, path: msg.path, error: err.message });
   }
 }
 

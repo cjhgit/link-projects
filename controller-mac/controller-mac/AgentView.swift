@@ -5,6 +5,7 @@ import AppKit
 struct AgentView: View {
     let session: LinkSession
     var initialCwd: String? = nil // 项目页「新建会话」跳转时预填的工作目录
+    var projectCwd: String? = nil // 项目详情里传入：各 tab 只显示该项目的会话
     @State private var sessions: [AgentSessionInfo] = []
     @State private var selectedId: String?
     @State private var prompt = ""
@@ -74,7 +75,13 @@ struct AgentView: View {
             }
             .persistedSplitView("agent-session-columns")
             .toolbar {
-                Button { scope = .mine; selectedId = nil; prompt = "" } label: { Image(systemName: "square.and.pencil") }.help("新建会话")
+                Button {
+                    scope = .mine
+                    selectedId = nil
+                    prompt = ""
+                    // 项目详情里新建会话：默认以项目目录为工作目录（可修改）
+                    if let projectCwd, cwd.isEmpty { cwd = projectCwd }
+                } label: { Image(systemName: "square.and.pencil") }.help("新建会话")
                 Button { confirmDelete = true } label: { Image(systemName: "trash") }
                     .help(scope == .mine ? "删除 Link 会话记录（不会删除 CLI 自己的会话）" : "历史会话由 CLI 官方文件管理，不能在这里删除")
                     .disabled(selected == nil || selected?.state == .running || scope != .mine)
@@ -132,6 +139,9 @@ struct AgentView: View {
                     if let selected {
                         HStack { Text(selected.title).font(.headline); Spacer(); stateLabel(selected.state) }
                         sessionIdRow(selected)
+                        Text("创建 \(Self.timeText(selected.createdAt)) · 更新 \(Self.timeText(selected.updatedAt))")
+                            .font(.caption)
+                            .foregroundStyle(.tertiary)
                         if isResponding {
                             HStack(spacing: 8) {
                                 ProgressView().controlSize(.small)
@@ -204,7 +214,7 @@ struct AgentView: View {
 
     private func refresh(_ targetId: String) {
         loading = true
-        session.listAgentSessions(targetId: targetId, scope: scope) { result in
+        session.listAgentSessions(targetId: targetId, scope: scope, cwd: projectCwd) { result in
             loading = false; sessions = result
             if selectedId != nil, !result.contains(where: { $0.id == selectedId }) { selectedId = nil }
             else if selectedId != nil { loadDetail(targetId) } // 摘要覆盖了消息，重新拉详情
@@ -234,5 +244,9 @@ struct AgentView: View {
     }
     private func upsert(_ item: AgentSessionInfo) { if let i = sessions.firstIndex(where: { $0.id == item.id }) { sessions[i] = item } else { sessions.insert(item, at: 0) } }
     @ViewBuilder private func stateIcon(_ state: AgentSessionState) -> some View { Image(systemName: state == .running ? "clock" : state == .completed ? "checkmark.circle" : "exclamationmark.triangle").foregroundStyle(state == .running ? .orange : state == .completed ? .green : .red) }
+    private static func timeText(_ ms: Double) -> String {
+        Date(timeIntervalSince1970: ms / 1000).formatted(date: .abbreviated, time: .shortened)
+    }
+
     @ViewBuilder private func stateLabel(_ state: AgentSessionState) -> some View { Text(state == .running ? "执行中" : state == .completed ? "已完成" : "失败").font(.caption).foregroundStyle(.secondary) }
 }

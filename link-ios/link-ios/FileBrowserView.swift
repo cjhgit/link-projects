@@ -26,6 +26,7 @@ struct FileBrowserView: View {
     @State private var loading = false
     @State private var errorMessage: String?
     @State private var showHidden = false
+    @State private var copiedPath = false // 当前路径复制成功后的短暂反馈
     @State private var pushDir: String? // 程序化跳转 push 的子目录
     @State private var viewer: FileViewerSheet?
     @State private var showCreateFile = false // 新建文本文件弹窗
@@ -114,14 +115,26 @@ struct FileBrowserView: View {
                 }
             } header: {
                 if !realPath.isEmpty {
-                    // 当前目录完整路径（可长按选中拷贝）
-                    Text(realPath)
-                        .font(.caption2.weight(.medium).monospaced())
-                        .foregroundStyle(.secondary)
-                        .lineLimit(1)
-                        .truncationMode(.middle)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .textSelection(.enabled)
+                    // 当前目录完整路径 + 一键复制
+                    HStack(spacing: 6) {
+                        Text(realPath)
+                            .font(.caption2.weight(.medium).monospaced())
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                            .truncationMode(.middle)
+                            .textSelection(.enabled)
+                        Button {
+                            UIPasteboard.general.string = realPath
+                            copiedPath = true
+                            DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) { copiedPath = false }
+                        } label: {
+                            Image(systemName: copiedPath ? "checkmark" : "doc.on.doc")
+                                .font(.caption2)
+                        }
+                        .buttonStyle(.borderless)
+                        .accessibilityLabel(copiedPath ? "已复制路径" : "复制当前路径")
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
                 }
             }
         }
@@ -453,10 +466,14 @@ struct FileViewerView: View {
     @State private var confirmClose = false
     @State private var confirmReload = false
     @State private var showingHTMLPreview = false
+    @State private var imageData: Data? // 图片查看模式：远端图片的二进制数据
 
     private var isDirty: Bool { content != savedContent }
     private var supportsHTMLPreview: Bool {
         ["html", "htm"].contains((path as NSString).pathExtension.lowercased())
+    }
+    private var isImage: Bool {
+        ["png", "jpg", "jpeg", "gif", "webp", "bmp", "heic", "heif", "avif", "ico"].contains((path as NSString).pathExtension.lowercased())
     }
 
     var body: some View {
@@ -535,6 +552,23 @@ struct FileViewerView: View {
                 Button("重试", action: reload)
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
+        } else if isImage {
+            if let imageData, let uiImage = UIImage(data: imageData) {
+                // 捏合缩放 + 双击复位；双击第二次放大到 3x
+                Image(uiImage: uiImage)
+                    .resizable()
+                    .aspectRatio(contentMode: .fit)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    .padding(8)
+                    .id("remote-image")
+            } else {
+                VStack(spacing: 10) {
+                    Text("无法解码图片").font(.headline)
+                    Text("该文件不是可显示的图片格式").font(.callout).foregroundStyle(.secondary)
+                    Button("重试", action: reload)
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+            }
         } else if supportsHTMLPreview && showingHTMLPreview {
             HTMLPreviewView(html: content)
         } else {
@@ -602,6 +636,20 @@ struct FileViewerView: View {
         loadError = nil
         saveError = nil
         savedAt = nil
+        if isImage {
+            // 图片走 base64 通道，不按 utf8 文本读取（避免乱码与超大解码）
+            session.readRemoteImage(path: path) { result in
+                loading = false
+                switch result {
+                case .ok(let dataUrl):
+                    imageData = Self.base64Data(from: dataUrl)
+                    if imageData == nil { loadError = "图片数据解码失败" }
+                case .failed(let error):
+                    loadError = error
+                }
+            }
+            return
+        }
         session.readRemoteFile(path: path) { result in
             loading = false
             switch result {
@@ -614,6 +662,12 @@ struct FileViewerView: View {
                 loadError = error
             }
         }
+    }
+
+    // data URL -> 二进制
+    private static func base64Data(from dataUrl: String) -> Data? {
+        guard let comma = dataUrl.range(of: ",") else { return nil }
+        return Data(base64Encoded: String(dataUrl[comma.upperBound...]))
     }
 
     private func save() {

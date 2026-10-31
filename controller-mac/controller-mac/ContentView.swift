@@ -577,6 +577,7 @@ private struct ClientEditView: View {
 struct TerminalView: View {
     @Environment(AppModel.self) private var model
     let session: LinkSession
+    var cwd: String? = nil // 项目详情里的终端：命令在该目录下执行
     @State private var input = ""
     @FocusState private var inputFocused: Bool
 
@@ -661,7 +662,7 @@ struct TerminalView: View {
     private func submit() {
         let text = input
         input = ""
-        session.submit(text)
+        session.submit(text, cwd: cwd)
     }
 
     private func scrollToBottom(_ proxy: ScrollViewProxy) {

@@ -17,8 +17,15 @@ struct WorkspaceView: View {
     @State private var tab: DetailTab = .projects
     @State private var filesDir: String? // 「文件」页要定位的目录（项目页发起）
     @State private var agentCwd: String? // 「Agent」页新建会话预填的工作目录（项目页发起）
+    @State private var projectDetail: ProjectInfo? // 项目详情：打开后顶替一级 tab（文件 / 终端 / Agent / 命令）
 
     var body: some View {
+        if let projectDetail {
+            // 项目详情是完整工作区，隐藏一级 tab
+            ProjectDetailView(session: session, project: projectDetail) {
+                self.projectDetail = nil
+            }
+        } else {
         VStack(spacing: 0) {
             Picker("工作模式", selection: $tab) {
                 Text("项目").tag(DetailTab.projects)
@@ -42,6 +49,9 @@ struct WorkspaceView: View {
                     onNewAgent: { cwd in
                         agentCwd = cwd
                         tab = .agent
+                    },
+                    onOpenDetail: { project in
+                        projectDetail = project
                     }
                 )
             case .commands:
@@ -61,6 +71,8 @@ struct WorkspaceView: View {
         .onChange(of: session.currentTarget) { _, _ in
             filesDir = nil
             agentCwd = nil
+            projectDetail = nil
+        }
         }
     }
 }
@@ -80,6 +92,7 @@ struct FileBrowserView: View {
     @State private var pathInput = "" // 路径输入框，与当前目录同步，可手动跳转
     @State private var viewer: FileViewerSheet?
     @State private var showHidden = false
+    @State private var copiedPath = false // 当前路径复制成功后的短暂反馈
     @State private var showCreateFile = false // 新建文本文件弹窗
     @State private var newFileName = ""
     @State private var confirmDelete = false // 删除确认弹窗
@@ -230,6 +243,18 @@ struct FileBrowserView: View {
             }
             .disabled(path.isEmpty || loading || session.transfer != nil || isServerTarget)
             .help(isServerTarget ? "上传仅支持云电脑客户端（服务器主机不支持）" : "上传本地文件到当前目录")
+
+            Button {
+                guard !path.isEmpty else { return }
+                NSPasteboard.general.clearContents()
+                NSPasteboard.general.setString(path, forType: .string)
+                copiedPath = true
+                DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) { copiedPath = false }
+            } label: {
+                Image(systemName: copiedPath ? "checkmark" : "doc.on.doc")
+            }
+            .disabled(path.isEmpty)
+            .help("复制当前路径")
 
             Button {
                 if !path.isEmpty { load(path) }
@@ -480,10 +505,14 @@ struct FileViewerView: View {
     @State private var confirmClose = false
     @State private var confirmReload = false
     @State private var showingHTMLPreview = false
+    @State private var imageData: Data? // 图片查看模式：远端图片的二进制数据
 
     private var isDirty: Bool { content != savedContent }
     private var supportsHTMLPreview: Bool {
         ["html", "htm"].contains((path as NSString).pathExtension.lowercased())
+    }
+    private var isImage: Bool {
+        ["png", "jpg", "jpeg", "gif", "webp", "bmp", "heic", "heif", "avif", "ico"].contains((path as NSString).pathExtension.lowercased())
     }
 
     var body: some View {
@@ -563,6 +592,20 @@ struct FileViewerView: View {
                 Button("重试", action: reload)
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
+        } else if isImage {
+            if let imageData, let nsImage = NSImage(data: imageData) {
+                imageView(nsImage)
+            } else {
+                VStack(spacing: 10) {
+                    Text("无法解码图片")
+                        .font(.headline)
+                    Text("该文件不是端上可显示的图片格式")
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                    Button("重试", action: reload)
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+            }
         } else if supportsHTMLPreview && showingHTMLPreview {
             HTMLPreviewView(html: content)
         } else {
@@ -586,6 +629,11 @@ struct FileViewerView: View {
                     .scrollContentBackground(.hidden)
             }
         }
+    }
+
+    // 等比缩放显示；点击可在适配窗口 / 原始尺寸间切换
+    private func imageView(_ nsImage: NSImage) -> some View {
+        ZoomableImageView(nsImage: nsImage)
     }
 
     private var footer: some View {
@@ -613,6 +661,20 @@ struct FileViewerView: View {
         loadError = nil
         saveError = nil
         savedAt = nil
+        if isImage {
+            // 图片走 base64 通道，不按 utf8 文本读取（避免乱码与超大解码）
+            session.readRemoteImage(path: path) { result in
+                loading = false
+                switch result {
+                case .ok(let dataUrl):
+                    imageData = Self.base64Data(from: dataUrl)
+                    if imageData == nil { loadError = "图片数据解码失败" }
+                case .failed(let error):
+                    loadError = error
+                }
+            }
+            return
+        }
         session.readRemoteFile(path: path) { result in
             loading = false
             switch result {
@@ -625,6 +687,12 @@ struct FileViewerView: View {
                 loadError = error
             }
         }
+    }
+
+    // data URL -> 二进制
+    private static func base64Data(from dataUrl: String) -> Data? {
+        guard let comma = dataUrl.range(of: ",") else { return nil }
+        return Data(base64Encoded: String(dataUrl[comma.upperBound...]))
     }
 
     private func save() {
@@ -708,4 +776,28 @@ enum FileFormat {
         if mb < 1024 { return String(format: "%.1f MB", mb) }
         return String(format: "%.1f GB", mb / 1024)
     }
+}
+
+
+// MARK: - 图片查看（等比适配窗口，滚轮 / 捏合缩放，双击复位）
+
+private struct ZoomableImageView: NSViewRepresentable {
+    let nsImage: NSImage
+
+    func makeNSView(context: Context) -> NSScrollView {
+        let scrollView = NSScrollView()
+        scrollView.autohidesScrollers = true
+        scrollView.backgroundColor = .windowBackgroundColor
+        let imageView = NSImageView(image: nsImage)
+        imageView.imageScaling = .scaleProportionallyDown
+        imageView.tag = 100
+        // 按图片尺寸内容自适应滚动区域
+        if let rep = nsImage.representations.first {
+            imageView.frame = NSRect(x: 0, y: 0, width: rep.pixelsWide, height: rep.pixelsHigh)
+        }
+        scrollView.documentView = imageView
+        return scrollView
+    }
+
+    func updateNSView(_ scrollView: NSScrollView, context: Context) {}
 }

@@ -408,9 +408,16 @@ private struct WorkspaceView: View {
     @State private var tab: DetailTab = .projects
     @State private var filesDir: String? // 「文件」页要定位的目录（项目页发起）
     @State private var agentCwd: String? // 「Agent」页新建会话预填的工作目录（项目页发起）
+    @State private var projectDetail: ProjectInfo? // 项目详情：打开后顶替一级 tab（文件 / 终端 / Agent / 命令）
 
     var body: some View {
         if let session = model.sessions[serverId] {
+            if let projectDetail {
+                // 项目详情是完整工作区，隐藏一级 tab
+                ProjectDetailView(session: session, project: projectDetail) {
+                    self.projectDetail = nil
+                }
+            } else {
             VStack(spacing: 0) {
                 Picker("工作模式", selection: $tab) {
                     Text("项目").tag(DetailTab.projects)
@@ -434,6 +441,9 @@ private struct WorkspaceView: View {
                         onNewAgent: { cwd in
                             agentCwd = cwd
                             tab = .agent
+                        },
+                        onOpenDetail: { project in
+                            projectDetail = project
                         }
                     )
                 case .commands:
@@ -461,6 +471,7 @@ private struct WorkspaceView: View {
             .onChange(of: session.currentTarget) { _, _ in
                 filesDir = nil
                 agentCwd = nil
+                projectDetail = nil
             }
             .toolbar {
                 ToolbarItem(placement: .topBarTrailing) {
@@ -482,6 +493,7 @@ private struct WorkspaceView: View {
                         Image(systemName: "ellipsis.circle")
                     }
                 }
+            }
             }
         } else {
             ContentUnavailableView("服务器不存在", systemImage: "server.rack")
@@ -668,6 +680,7 @@ private struct ClientEditView: View {
 
 struct TerminalView: View {
     let session: LinkSession
+    var cwd: String? = nil // 项目详情里的终端：命令在该目录下执行
     @State private var input = ""
     @FocusState private var inputFocused: Bool
 
@@ -752,7 +765,7 @@ struct TerminalView: View {
     private func submit() {
         let text = input
         input = ""
-        session.submit(text)
+        session.submit(text, cwd: cwd)
     }
 
     private func scrollToBottom(_ proxy: ScrollViewProxy) {

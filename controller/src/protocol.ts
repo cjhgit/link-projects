@@ -111,6 +111,23 @@ export interface FileEntry {
   mtime: number; // 修改时间（毫秒），取不到为 0
 }
 
+// 读取图片文件（服务端 / client 就地转 base64，一次性返回 data URL；过大或非图片报错）
+export interface FileImageMsg {
+  type: 'file-image';
+  reqId: string;
+  targetId: string;
+  path: string;
+}
+
+export interface FileImageContentMsg {
+  type: 'file-image-content';
+  reqId: string;
+  targetId: string;
+  path: string;
+  dataUrl?: string; // data:image/png;base64,...，供端上直接解码显示
+  error?: string;
+}
+
 export interface FileListMsg {
   type: 'file-list';
   reqId: string;
@@ -228,6 +245,7 @@ export interface AgentListMsg {
   reqId: string;
   targetId: string;
   scope?: AgentListScope;
+  cwd?: string; // 项目详情里传入：只返回工作目录为该项目的会话（各历史 tab 按官方文件归属过滤）
 }
 
 // 新建会话（不传 sessionId）或在既有会话中继续对话（传 sessionId）；
@@ -363,6 +381,8 @@ export type ServerMsg =
   | FileCreateMsg
   | FileDeleteMsg
   | FileListMsg
+  | FileImageMsg
+  | FileImageContentMsg
   | FileUploadStartMsg
   | FileUploadChunkMsg
   | FileUploadFinishMsg

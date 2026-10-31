@@ -51,6 +51,7 @@ nonisolated struct FileEntryInfo: Identifiable, Equatable {
 nonisolated enum FileReply {
     case listing(path: String, entries: [FileEntryInfo])
     case content(String)
+    case image(String) // 图片查看：data URL（data:image/...;base64,...）
     case ack(ok: Bool, error: String?) // 写入回执
     case chunk(data: Data, done: Bool, size: Int64) // 下载分块（done 为最后一条）
     case failure(String)
@@ -129,6 +130,7 @@ nonisolated enum IncomingMessage {
     case execOutput(reqId: String, stream: String, data: String, targetId: String)
     case execExit(reqId: String, code: Int?, targetId: String)
     case fileContent(reqId: String, content: String?, error: String?, targetId: String)
+    case fileImageContent(reqId: String, dataUrl: String?, error: String?, targetId: String)
     case fileListing(reqId: String, path: String, entries: [FileEntryInfo]?, error: String?, targetId: String)
     case fileDownloadData(reqId: String, offset: Int64, data: String, done: Bool, size: Int64, targetId: String)
     case done(reqId: String, ok: Bool, error: String?, targetId: String)
@@ -181,6 +183,13 @@ nonisolated enum IncomingMessage {
             return .execExit(
                 reqId: obj["reqId"] as? String ?? "",
                 code: code,
+                targetId: obj["targetId"] as? String ?? ""
+            )
+        case "file-image-content":
+            return .fileImageContent(
+                reqId: obj["reqId"] as? String ?? "",
+                dataUrl: obj["dataUrl"] as? String,
+                error: obj["error"] as? String,
                 targetId: obj["targetId"] as? String ?? ""
             )
         case "file-content":
@@ -256,8 +265,14 @@ nonisolated enum OutgoingMessage {
         json(["type": "list-clients"])
     }
 
-    static func exec(reqId: String, targetId: String, command: String) -> String {
-        json(["type": "exec", "reqId": reqId, "targetId": targetId, "command": command])
+    static func exec(reqId: String, targetId: String, command: String, cwd: String? = nil) -> String {
+        var value: [String: Any] = ["type": "exec", "reqId": reqId, "targetId": targetId, "command": command]
+        if let cwd, !cwd.isEmpty { value["cwd"] = cwd }
+        return json(value)
+    }
+
+    static func fileImage(reqId: String, targetId: String, path: String) -> String {
+        json(["type": "file-image", "reqId": reqId, "targetId": targetId, "path": path])
     }
 
     static func fileRead(reqId: String, targetId: String, path: String) -> String {
@@ -286,7 +301,7 @@ nonisolated enum OutgoingMessage {
     static func fileUploadFinish(reqId: String, targetId: String) -> String { json(["type": "file-upload-finish", "reqId": reqId, "targetId": targetId]) }
     static func fileDownload(reqId: String, targetId: String, path: String) -> String { json(["type": "file-download", "reqId": reqId, "targetId": targetId, "path": path]) }
 
-    static func agentList(reqId: String, targetId: String, scope: AgentListScope = .mine) -> String { json(["type": "agent-list", "reqId": reqId, "targetId": targetId, "scope": scope.rawValue]) }
+    static func agentList(reqId: String, targetId: String, scope: AgentListScope = .mine, cwd: String? = nil) -> String { var value: [String: Any] = ["type": "agent-list", "reqId": reqId, "targetId": targetId, "scope": scope.rawValue]; if let cwd, !cwd.isEmpty { value["cwd"] = cwd }; return json(value) }
     // agent 仅新建会话时传（继续会话时 client 以会话记录保存的类型为准）
     static func agentRun(reqId: String, targetId: String, prompt: String, sessionId: String?, cwd: String?, agent: AgentKind? = nil) -> String { var value: [String: Any] = ["type": "agent-run", "reqId": reqId, "targetId": targetId, "prompt": prompt]; if let sessionId { value["sessionId"] = sessionId }; if let cwd, !cwd.isEmpty { value["cwd"] = cwd }; if let agent { value["agent"] = agent.rawValue }; return json(value) }
     static func agentStatus(reqId: String, targetId: String, sessionId: String) -> String { json(["type": "agent-status", "reqId": reqId, "targetId": targetId, "sessionId": sessionId]) }

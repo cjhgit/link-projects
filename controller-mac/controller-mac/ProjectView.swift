@@ -6,6 +6,7 @@ struct ProjectView: View {
     let session: LinkSession
     let onOpenFiles: (String) -> Void
     let onNewAgent: (String) -> Void
+    var onOpenDetail: ((ProjectInfo) -> Void)? = nil // 打开项目详情（文件 / 终端 / Agent / 命令）
 
     @State private var projects: [ProjectInfo] = []
     @State private var loading = false
@@ -123,6 +124,15 @@ struct ProjectView: View {
             }
             .buttonStyle(.borderless)
             .help("在「文件」页打开该目录")
+            if let onOpenDetail {
+                Button {
+                    onOpenDetail(project)
+                } label: {
+                    Image(systemName: "square.grid.2x2")
+                }
+                .buttonStyle(.borderless)
+                .help("打开项目详情（文件 / 终端 / Agent / 命令）")
+            }
             Button {
                 onNewAgent(project.path)
             } label: {
@@ -133,6 +143,11 @@ struct ProjectView: View {
         }
         .padding(.vertical, 1)
         .contextMenu {
+            if let onOpenDetail {
+                Button { onOpenDetail(project) } label: {
+                    Label("项目详情", systemImage: "square.grid.2x2")
+                }
+            }
             Button { onOpenFiles(project.path) } label: {
                 Label("打开目录", systemImage: "folder")
             }
@@ -176,6 +191,95 @@ struct ProjectView: View {
     private func copy(_ text: String) {
         NSPasteboard.general.clearContents()
         NSPasteboard.general.setString(text, forType: .string)
+    }
+}
+
+// MARK: - 项目详情：一个项目的专属工作区（文件 / 终端 / Agent / 命令）
+
+struct ProjectDetailView: View {
+    let session: LinkSession
+    let project: ProjectInfo
+    var onClose: () -> Void
+
+    enum Tab: Hashable {
+        case files, terminal, agent, commands, git
+    }
+
+    @State private var tab: Tab = .files
+    @State private var branch: String? // git 项目当前分支（非 git 项目为 nil）
+
+    var body: some View {
+        VStack(spacing: 0) {
+            HStack(spacing: 8) {
+                Button(action: onClose) {
+                    Image(systemName: "chevron.left")
+                }
+                .help("返回项目列表")
+                Image(systemName: "folder.fill")
+                    .foregroundStyle(Color.accentColor)
+                VStack(alignment: .leading, spacing: 1) {
+                    Text(project.name).font(.headline).lineLimit(1)
+                    Text(project.path)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                        .textSelection(.enabled)
+                }
+                if let branch {
+                    // git 项目显示当前分支（detached HEAD 时为短 hash）
+                    Label(branch, systemImage: "arrow.triangle.branch")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .padding(.horizontal, 6)
+                        .padding(.vertical, 2)
+                        .background(Color.secondary.opacity(0.12))
+                        .clipShape(Capsule())
+                        .help("当前分支")
+                }
+                Spacer()
+                Picker("功能", selection: $tab) {
+                    Text("文件").tag(Tab.files)
+                    Text("终端").tag(Tab.terminal)
+                    Text("Agent").tag(Tab.agent)
+                    Text("命令").tag(Tab.commands)
+                    Text("Git").tag(Tab.git)
+                }
+                .pickerStyle(.segmented)
+                .frame(width: 360)
+            }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 8)
+            Divider()
+            switch tab {
+            case .files:
+                FileBrowserView(session: session, initialDir: project.path)
+            case .terminal:
+                TerminalView(session: session, cwd: project.path)
+            case .agent:
+                // 只传过滤、不传 initialCwd：默认显示该项目的会话列表而非新建态
+                AgentView(session: session, projectCwd: project.path)
+            case .commands:
+                TerminalCommandView(session: session) { command in
+                    session.submit(command, cwd: project.path)
+                    tab = .terminal
+                }
+            case .git:
+                GitView(session: session, projectPath: project.path)
+            }
+        }
+        .onAppear(perform: loadBranch)
+    }
+
+    // git 项目探测当前分支；非 git 项目保持 nil 不显示
+    private func loadBranch() {
+        session.runCommand(
+            "(git branch --show-current 2>/dev/null || git rev-parse --short HEAD 2>/dev/null)",
+            cwd: project.path
+        ) { out, error in
+            let text = (out ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+            branch = (error == nil && !text.isEmpty) ? text : nil
+        }
     }
 }
 
@@ -249,5 +353,190 @@ private struct ProjectEditView: View {
             busy = false
             if let error { errorMessage = error } else { dismiss() }
         }
+    }
+}
+
+
+// MARK: - Git（项目详情）：变更（已暂存 / 未暂存）与提交列表
+
+private struct GitChange: Identifiable {
+    let code: String // 两字符状态码（如 "M "、" M"、"??")
+    let path: String
+    var id: String { "\(code)-\(path)" }
+
+    // 状态码 -> 摘要（M 修改 / A 新增 / D 删除 / R 重命名 / ? 未跟踪）
+    var summary: String {
+        let c = code.trimmingCharacters(in: .whitespaces)
+        return c == "??" ? "未跟踪" : c
+    }
+}
+
+private struct GitCommit: Identifiable {
+    let hash: String
+    let author: String
+    let date: String
+    let subject: String
+    var id: String { hash }
+}
+
+struct GitView: View {
+    let session: LinkSession
+    let projectPath: String
+
+    enum SubTab: Hashable {
+        case changes, log
+    }
+
+    @State private var subTab: SubTab = .changes
+    @State private var staged: [GitChange] = []
+    @State private var unstaged: [GitChange] = []
+    @State private var commits: [GitCommit] = []
+    @State private var loading = false
+    @State private var errorMessage: String?
+    @State private var copiedHash = false
+
+    var body: some View {
+        VStack(spacing: 0) {
+            Picker("Git 视图", selection: $subTab) {
+                Text("变更").tag(SubTab.changes)
+                Text("提交").tag(SubTab.log)
+            }
+            .pickerStyle(.segmented)
+            .frame(width: 160)
+            .padding(.vertical, 8)
+            Divider()
+            if let errorMessage {
+                VStack(spacing: 10) {
+                    Text("读取失败").font(.headline)
+                    Text(errorMessage).font(.callout).foregroundStyle(.red)
+                    Button("重试", action: refresh)
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else if loading && staged.isEmpty && unstaged.isEmpty && commits.isEmpty {
+                ProgressView("读取中…")
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else {
+                switch subTab {
+                case .changes: changesView
+                case .log: logView
+                }
+            }
+        }
+        .toolbar {
+            Button(action: refresh) { Image(systemName: "arrow.clockwise") }
+                .help("刷新 Git 状态")
+                .disabled(loading)
+        }
+        .onAppear { if staged.isEmpty && commits.isEmpty { refresh() } }
+        .onChange(of: subTab) { _, _ in refresh() }
+    }
+
+    // 变更：已暂存（上）/ 未暂存（下），各占一半
+    private var changesView: some View {
+        VStack(spacing: 0) {
+            changePane(title: "已暂存", changes: staged, tint: .green)
+            Divider()
+            changePane(title: "未暂存", changes: unstaged, tint: .orange)
+        }
+    }
+
+    private func changePane(title: String, changes: [GitChange], tint: Color) -> some View {
+        VStack(spacing: 0) {
+            HStack {
+                Text("\(title)（\(changes.count)）")
+                    .font(.callout.weight(.medium))
+                    .foregroundStyle(.secondary)
+                Spacer()
+            }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 6)
+            List(changes) { change in
+                HStack(spacing: 8) {
+                    Text(change.summary)
+                        .font(.caption.monospaced())
+                        .foregroundStyle(tint)
+                        .frame(width: 52, alignment: .leading)
+                    Text(change.path)
+                        .font(.callout.monospaced())
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                        .textSelection(.enabled)
+                }
+                .padding(.vertical, 1)
+            }
+            .listStyle(.plain)
+        }
+        .frame(maxHeight: .infinity)
+    }
+
+    // 提交列表（limit 100，避免大仓库全量拉取）
+    private var logView: some View {
+        List(commits) { commit in
+            HStack(spacing: 8) {
+                Text(copiedHash ? "已复制" : commit.hash)
+                    .font(.caption.monospaced())
+                    .foregroundStyle(.tertiary)
+                    .onTapGesture {
+                        NSPasteboard.general.clearContents()
+                        NSPasteboard.general.setString(commit.hash, forType: .string)
+                        copiedHash = true
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) { copiedHash = false }
+                    }
+                    .help("点击复制提交号")
+                VStack(alignment: .leading, spacing: 1) {
+                    Text(commit.subject).lineLimit(1)
+                    Text("\(commit.author) · \(commit.date)")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                Spacer()
+            }
+            .padding(.vertical, 1)
+        }
+        .listStyle(.plain)
+        .overlay {
+            if commits.isEmpty && !loading {
+                ContentUnavailableView("暂无提交", systemImage: "clock.arrow.circlepath")
+            }
+        }
+    }
+
+    private func refresh() {
+        loading = true
+        errorMessage = nil
+        let group = DispatchGroup()
+
+        // 状态：XY 两字符，X = 已暂存，Y = 工作区（?? = 未跟踪，归入未暂存）
+        group.enter()
+        session.runCommand("git status --porcelain", cwd: projectPath) { out, error in
+            defer { group.leave() }
+            if let error { errorMessage = error; return }
+            var s: [GitChange] = []
+            var u: [GitChange] = []
+            for line in (out ?? "").split(separator: "\n") {
+                let chars = Array(line)
+                guard chars.count >= 3 else { continue }
+                let code = String(chars[0...1])
+                let path = String(chars[3...])
+                if chars[0] != " " && chars[0] != "?" { s.append(GitChange(code: code, path: path)) }
+                if chars[1] != " " || chars[0] == "?" { u.append(GitChange(code: code, path: path)) }
+            }
+            staged = s
+            unstaged = u
+        }
+
+        // 提交：短号 / 作者 / 日期 / 标题，最多 100 条
+        group.enter()
+        session.runCommand("git log --max-count=100 --date=short --pretty=format:%h%x1f%an%x1f%ad%x1f%s", cwd: projectPath) { out, error in
+            defer { group.leave() }
+            if let error { errorMessage = error; return }
+            commits = (out ?? "").split(separator: "\n").compactMap { line in
+                let parts = line.components(separatedBy: "\u{1f}")
+                guard parts.count >= 4 else { return nil }
+                return GitCommit(hash: parts[0], author: parts[1], date: parts[2], subject: parts[3...].joined(separator: "\u{1f}"))
+            }
+        }
+
+        group.notify(queue: .main) { loading = false }
     }
 }

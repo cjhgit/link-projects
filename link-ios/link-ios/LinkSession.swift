@@ -167,6 +167,9 @@ final class LinkSession: NSObject, URLSessionWebSocketDelegate {
         for callback in pendingFiles.values { callback(.failure("连接已断开")) }
         agentCallbacks.removeAll()
         agentUpdateHandlers.removeAll()
+        execCallbacks.removeAll()
+        execStdout.removeAll()
+        execStderr.removeAll()
         // 项目管理同理
         let pendingProjects = projectCallbacks
         projectCallbacks.removeAll()
@@ -276,19 +279,43 @@ final class LinkSession: NSObject, URLSessionWebSocketDelegate {
             }
 
         case .execOutput(let reqId, let stream, let data, let targetId):
-            outputReqIds.insert(reqId)
-            append(Ansiless.strip(data), stream == "stderr" ? .stderr : .stdout, to: targetId)
+            // 静默命令（Git 等）：收集输出，不进终端
+            if execCallbacks[reqId] != nil {
+                if stream == "stderr" { execStderr[reqId, default: ""] += data }
+                else { execStdout[reqId, default: ""] += data }
+            } else {
+                outputReqIds.insert(reqId)
+                append(Ansiless.strip(data), stream == "stderr" ? .stderr : .stdout, to: targetId)
+            }
 
         case .execExit(let reqId, let code, let targetId):
-            // 整个过程没有任何 stdout/stderr 时明确提示，避免误以为卡住
-            if outputReqIds.remove(reqId) == nil {
-                append("[无输出]", .system, to: targetId)
+            if let callback = execCallbacks.removeValue(forKey: reqId) {
+                let out = execStdout.removeValue(forKey: reqId) ?? ""
+                let err = execStderr.removeValue(forKey: reqId) ?? ""
+                if let code, code != 0 {
+                    callback(out, err.isEmpty ? "退出码 \(code)" : err)
+                } else {
+                    callback(out, nil)
+                }
+            } else {
+                // 整个过程没有任何 stdout/stderr 时明确提示，避免误以为卡住
+                if outputReqIds.remove(reqId) == nil {
+                    append("[无输出]", .system, to: targetId)
+                }
+                if let code, code != 0 {
+                    append("[退出码 \(code)]", .system, to: targetId)
+                }
+                appendSeparator(to: targetId)
             }
-            if let code, code != 0 {
-                append("[退出码 \(code)]", .system, to: targetId)
-            }
-            appendSeparator(to: targetId)
 
+        case .fileImageContent(let reqId, let dataUrl, let error, _):
+            if let callback = fileCallbacks.removeValue(forKey: reqId) {
+                if let error {
+                    callback(.failure(error))
+                } else if let dataUrl {
+                    callback(.image(dataUrl))
+                }
+            }
         case .fileContent(let reqId, let content, let error, let targetId):
             // 文件界面的读取请求：路由到回调，不进终端
             if let callback = fileCallbacks.removeValue(forKey: reqId) {
@@ -380,11 +407,11 @@ final class LinkSession: NSObject, URLSessionWebSocketDelegate {
     // MARK: - Agent 会话（Claude Code / Codex，会话数据在 client 本机持久化，不在 server 保存）
 
     // scope：mine = 本软件的会话（默认），history = Claude Code 官方记录里发现的外部会话
-    func listAgentSessions(targetId: String, scope: AgentListScope = .mine, completion: @escaping ([AgentSessionInfo]) -> Void) {
+    func listAgentSessions(targetId: String, scope: AgentListScope = .mine, cwd: String? = nil, completion: @escaping ([AgentSessionInfo]) -> Void) {
         guard state == .connected else { completion([]); return }
         let reqId = UUID().uuidString
         agentCallbacks[reqId] = completion
-        send(OutgoingMessage.agentList(reqId: reqId, targetId: targetId, scope: scope))
+        send(OutgoingMessage.agentList(reqId: reqId, targetId: targetId, scope: scope, cwd: cwd))
     }
 
     func runAgent(targetId: String, prompt: String, sessionId: String? = nil, cwd: String? = nil, agent: AgentKind? = nil, completion: @escaping ([AgentSessionInfo]) -> Void) {
@@ -461,7 +488,20 @@ final class LinkSession: NSObject, URLSessionWebSocketDelegate {
         send(OutgoingMessage.listClients())
     }
 
-    func submit(_ raw: String) {
+    // 静默执行命令：输出不进终端，完成后一次性回调（Git 等功能用）
+    private var execCallbacks: [String: (String?, String?) -> Void] = [:]
+    private var execStdout: [String: String] = [:]
+    private var execStderr: [String: String] = [:]
+
+    func runCommand(_ command: String, cwd: String? = nil, completion: @escaping (String?, String?) -> Void) {
+        guard state == .connected else { return completion(nil, "未连接服务器") }
+        guard let target = currentTarget else { return completion(nil, "未选择目标") }
+        let reqId = newReqId()
+        execCallbacks[reqId] = completion
+        send(OutgoingMessage.exec(reqId: reqId, targetId: target, command: command, cwd: cwd))
+    }
+
+    func submit(_ raw: String, cwd: String? = nil) {
         let input = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !input.isEmpty else { return }
         append("\(currentTarget ?? "(未选择)")> \(input)", .command)
@@ -536,7 +576,7 @@ final class LinkSession: NSObject, URLSessionWebSocketDelegate {
 
         // 其余输入作为 shell 命令下发（客户端与服务器主机目标均在远端执行）
         guard requireTarget() else { return }
-        send(OutgoingMessage.exec(reqId: newReqId(), targetId: currentTarget!, command: input))
+        send(OutgoingMessage.exec(reqId: newReqId(), targetId: currentTarget!, command: input, cwd: cwd))
     }
 
     private func requireTarget() -> Bool {
@@ -572,6 +612,24 @@ final class LinkSession: NSObject, URLSessionWebSocketDelegate {
     }
 
     /// 读取远程文本文件内容
+    // 图片查看：返回 data URL（data:image/...;base64,...）
+    func readRemoteImage(path: String, completion: @escaping (FileOutcome<String>) -> Void) {
+        guard state == .connected else { return completion(.failed("未连接服务器")) }
+        guard let target = currentTarget else { return completion(.failed("未选择客户端")) }
+        let reqId = newReqId()
+        fileCallbacks[reqId] = { reply in
+            switch reply {
+            case .image(let dataUrl):
+                completion(.ok(dataUrl))
+            case .failure(let error):
+                completion(.failed(error))
+            default:
+                completion(.failed("意外响应"))
+            }
+        }
+        send(OutgoingMessage.fileImage(reqId: reqId, targetId: target, path: path))
+    }
+
     func readRemoteFile(path: String, completion: @escaping (FileOutcome<String>) -> Void) {
         guard state == .connected else { return completion(.failed("未连接服务器")) }
         guard let target = currentTarget else { return completion(.failed("未选择客户端")) }
