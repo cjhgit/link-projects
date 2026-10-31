@@ -31,11 +31,12 @@ struct AgentView: View {
                 VStack(spacing: 0) {
                     Picker("范围", selection: $scope) {
                         Text("会话").tag(AgentListScope.mine)
-                        Text("Claude 历史").tag(AgentListScope.history)
+                        Text("Claude 历史").tag(AgentListScope.claudeHistory)
+                        Text("Codex 历史").tag(AgentListScope.codexHistory)
                     }
                     .pickerStyle(.segmented)
                     .padding(.horizontal, 8).padding(.vertical, 6)
-                    .help("「会话」= 本软件发起或继续过对话的会话；「Claude 历史」= 云电脑上 Claude Code 直接发起的对话，完全由官方会话文件决定，回复不会使它离开这里")
+                    .help("「会话」= 本软件发起或继续过对话的会话；「Claude 历史 / Codex 历史」= 云电脑上 CLI 直接发起的对话，完全由官方会话文件决定，回复不会使它离开这里")
                     Divider()
                     List(selection: $selectedId) {
                         ForEach(sessions) { item in
@@ -50,7 +51,7 @@ struct AgentView: View {
                                     }
                                     Text(item.agent == .codex ? "Codex" : "Claude").font(.caption2).foregroundStyle(.secondary).padding(.horizontal, 5).padding(.vertical, 1).background(Color.secondary.opacity(0.15)).clipShape(Capsule())
                                     // Claude 历史的状态只由官方 jsonl 决定（存在即完整），不显示本软件的运行状态
-                                    stateIcon(scope == .history ? .completed : item.state)
+                                    stateIcon(scope == .mine ? item.state : .completed)
                                 }
                                 Text(item.cwd ?? "默认目录").font(.caption).foregroundStyle(.secondary).lineLimit(1)
                             }.tag(item.id)
@@ -58,7 +59,7 @@ struct AgentView: View {
                     }
                     .overlay {
                         if sessions.isEmpty && !loading {
-                            ContentUnavailableView(scope == .history ? "暂无 Claude 历史对话" : "还没有会话", systemImage: scope == .history ? "clock.arrow.circlepath" : "sparkles", description: Text(scope == .history ? "云电脑的 Claude Code 输入历史里暂无可恢复的会话" : "在下方输入任务，或从项目页发起新会话"))
+                            ContentUnavailableView(scope == .mine ? "还没有会话" : historyEmptyTitle, systemImage: scope == .mine ? "sparkles" : "clock.arrow.circlepath", description: Text(scope == .mine ? "在下方输入任务，或从项目页发起新会话" : "云电脑的 \(historyEmptyTitle)里暂无可恢复的会话"))
                         }
                     }
                 }
@@ -73,8 +74,8 @@ struct AgentView: View {
             .toolbar {
                 Button { scope = .mine; selectedId = nil; prompt = "" } label: { Image(systemName: "square.and.pencil") }.help("新建会话")
                 Button { confirmDelete = true } label: { Image(systemName: "trash") }
-                    .help(scope == .history ? "Claude 历史会话由 Claude Code 管理，不能在这里删除" : "删除 Link 会话记录（不会删除 CLI 自己的会话）")
-                    .disabled(selected == nil || selected?.state == .running || scope == .history)
+                    .help(scope == .mine ? "删除 Link 会话记录（不会删除 CLI 自己的会话）" : "历史会话由 CLI 官方文件管理，不能在这里删除")
+                    .disabled(selected == nil || selected?.state == .running || scope != .mine)
                 Button { refresh(targetId) } label: { Image(systemName: "arrow.clockwise") }.help("刷新会话状态和输出").disabled(loading)
             }
             .confirmationDialog("删除 Link 会话记录", isPresented: $confirmDelete) {
@@ -152,7 +153,7 @@ struct AgentView: View {
                             // 无增量输出时也给出“正在处理”的占位（官方 jsonl 未落盘、CLI 尚未产出文本）
                             Text("正在处理…").font(.callout).foregroundStyle(.secondary).padding(10)
                         }
-                    } else if scope == .history {
+                    } else if scope != .mine {
                         ContentUnavailableView("选择一个历史会话", systemImage: "clock.arrow.circlepath", description: Text("消息读取自云电脑上 Claude Code 的官方会话文件；输入内容即可在这个会话里继续对话。"))
                     } else {
                         ContentUnavailableView("新建 Agent 会话", systemImage: "sparkles", description: Text("选择 Claude Code 或 Codex，输入任务后会在所选云电脑运行；可随时刷新查看完成状态。"))
@@ -177,10 +178,10 @@ struct AgentView: View {
                 }
             }
             HStack(alignment: .bottom) {
-                TextField(selectedId == nil ? (scope == .history ? "先在左侧选择一个会话" : "告诉 \(agentKind.displayName) 要做什么") : "继续这个会话", text: $prompt, axis: .vertical)
+                TextField(selectedId == nil ? (scope == .mine ? "告诉 \(agentKind.displayName) 要什么" : "先在左侧选择一个会话") : "继续这个会话", text: $prompt, axis: .vertical)
                     .lineLimit(1...5).textFieldStyle(.roundedBorder)
                     .onSubmit { run(targetId) }
-                Button("发送") { run(targetId) }.disabled(prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || isResponding || (scope == .history && selectedId == nil))
+                Button("发送") { run(targetId) }.disabled(prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || isResponding || (scope != .mine && selectedId == nil))
             }
             if isResponding { Text("任务正在云电脑执行；网络断开后仍可稍后刷新查看结果。").font(.caption).foregroundStyle(.secondary).frame(maxWidth: .infinity, alignment: .leading) }
         }.padding(10)
@@ -194,6 +195,8 @@ struct AgentView: View {
         prompt = ""
         cwd = initialCwd
     }
+
+    private var historyEmptyTitle: String { scope == .codexHistory ? "Codex 历史对话" : "Claude 历史对话" }
 
     private func refresh(_ targetId: String) {
         loading = true

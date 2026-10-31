@@ -9,6 +9,7 @@ struct AgentView: View {
     @State private var creating = false
     @State private var prompt = ""
     @State private var cwd = ""
+    @State private var agentKind: AgentKind = .claude // 新建会话使用的 CLI，默认 Claude Code
     @State private var loading = false
     @State private var sending = false
     @State private var confirmDelete = false
@@ -85,7 +86,7 @@ struct AgentView: View {
                 } label: { Image(systemName: "chevron.left") }
                 .accessibilityLabel("返回列表")
             }
-            Text(selected?.title ?? (creating ? "新建会话" : scope == .history ? "Claude 历史" : "会话"))
+            Text(selected?.title ?? (creating ? "新建会话" : scope == .codexHistory ? "Codex 历史" : scope == .claudeHistory ? "Claude 历史" : "会话"))
                 .font(.headline).lineLimit(1)
             Spacer()
             if creating {
@@ -192,14 +193,15 @@ struct AgentView: View {
 
     // Claude 历史列表的状态只由官方 jsonl 决定（存在即完整），不显示本软件的运行状态
     private func effectiveState(_ item: AgentSessionInfo) -> AgentSessionState {
-        scope == .history ? .completed : item.state
+        scope == .mine ? item.state : .completed
     }
 
     private var sessionList: some View {
         VStack(spacing: 0) {
             Picker("范围", selection: $scope) {
                 Text("会话").tag(AgentListScope.mine)
-                Text("Claude 历史").tag(AgentListScope.history)
+                Text("Claude 历史").tag(AgentListScope.claudeHistory)
+                Text("Codex 历史").tag(AgentListScope.codexHistory)
             }
             .pickerStyle(.segmented)
             .padding(.horizontal, 12).padding(.vertical, 6)
@@ -230,15 +232,15 @@ struct AgentView: View {
                         confirmDelete = true
                     }
                     // History 里的会话由 Claude Code 管理，不能在这里删除
-                    .disabled(item.state == .running || scope == .history)
+                    .disabled(item.state == .running || scope != .mine)
                 }
             }
             .overlay {
                 if sessions.isEmpty && !loading {
                     ContentUnavailableView(
-                        scope == .history ? "暂无 Claude 历史对话" : "暂无会话",
-                        systemImage: scope == .history ? "clock.arrow.circlepath" : "bubble.left.and.bubble.right",
-                        description: Text(scope == .history ? "云电脑的 Claude Code 输入历史里暂无可恢复的会话" : "点击右上角 + 在云电脑创建 Claude Code 会话。")
+                        scope == .mine ? "暂无会话" : "暂无\(scope == .codexHistory ? " Codex" : " Claude") 历史对话",
+                        systemImage: scope == .mine ? "bubble.left.and.bubble.right" : "clock.arrow.circlepath",
+                        description: Text(scope == .mine ? "点击右上角 + 在云电脑创建 Claude Code 会话。" : "云电脑的官方会话文件里暂无可恢复的会话")
                     )
                 }
             }
@@ -295,10 +297,17 @@ struct AgentView: View {
     private func composer(_ targetId: String) -> some View {
         VStack(spacing: 6) {
             if creating {
-                TextField("工作目录（默认 ~/.link-projects/workspace）", text: $cwd).textFieldStyle(.roundedBorder)
+                HStack(spacing: 8) {
+                    TextField("工作目录（默认 ~/.link-projects/workspace）", text: $cwd).textFieldStyle(.roundedBorder)
+                    Picker("CLI", selection: $agentKind) {
+                        Text("Claude Code").tag(AgentKind.claude)
+                        Text("Codex").tag(AgentKind.codex)
+                    }.pickerStyle(.menu).labelsHidden().fixedSize()
+                        .help("新建会话使用的命令行工具；Claude Code 为默认。")
+                }
             }
             HStack(alignment: .bottom) {
-                TextField(creating ? "告诉 Claude Code 要做什么" : "继续这个会话", text: $prompt, axis: .vertical)
+                TextField(creating ? "告诉 \(agentKind.displayName) 要做什么" : "继续这个会话", text: $prompt, axis: .vertical)
                     .lineLimit(1...4).textFieldStyle(.roundedBorder)
                 Button { run(targetId) } label: { Image(systemName: "arrow.up.circle.fill").font(.title2) }
                     .disabled(prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || isResponding)
@@ -354,7 +363,7 @@ struct AgentView: View {
     private func run(_ targetId: String) {
         let text = prompt.trimmingCharacters(in: .whitespacesAndNewlines); guard !text.isEmpty else { return }
         sending = true
-        session.runAgent(targetId: targetId, prompt: text, sessionId: selectedId, cwd: creating ? cwd : nil) { result in
+        session.runAgent(targetId: targetId, prompt: text, sessionId: selectedId, cwd: creating ? cwd : nil, agent: creating ? agentKind : nil) { result in
             sending = false; prompt = ""
             if let item = result.first {
                 if let i = sessions.firstIndex(where: { $0.id == item.id }) { sessions[i] = item } else { sessions.insert(item, at: 0) }

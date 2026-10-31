@@ -387,11 +387,11 @@ final class LinkSession: NSObject, URLSessionWebSocketDelegate {
         send(OutgoingMessage.agentList(reqId: reqId, targetId: targetId, scope: scope))
     }
 
-    func runAgent(targetId: String, prompt: String, sessionId: String? = nil, cwd: String? = nil, completion: @escaping ([AgentSessionInfo]) -> Void) {
+    func runAgent(targetId: String, prompt: String, sessionId: String? = nil, cwd: String? = nil, agent: AgentKind? = nil, completion: @escaping ([AgentSessionInfo]) -> Void) {
         guard state == .connected else { completion([]); return }
         let reqId = UUID().uuidString
         agentCallbacks[reqId] = completion
-        send(OutgoingMessage.agentRun(reqId: reqId, targetId: targetId, prompt: prompt, sessionId: sessionId, cwd: cwd))
+        send(OutgoingMessage.agentRun(reqId: reqId, targetId: targetId, prompt: prompt, sessionId: sessionId, cwd: cwd, agent: agent))
     }
 
     func agentStatus(targetId: String, sessionId: String, completion: @escaping ([AgentSessionInfo]) -> Void) {

@@ -215,9 +215,11 @@ export interface AgentSession {
   messages: AgentMessage[];
 }
 
-// 会话列表的范围：mine = 本软件发起或继续过对话的会话（默认，含从 history 导入的）；
-// history = 从 Claude Code 官方记录（history.jsonl）发现、尚未在本软件继续过对话的外部会话
-export type AgentListScope = 'mine' | 'history';
+// 会话列表的范围：mine = 本软件发起或继续过对话的会话（默认，含从历史导入的）；
+// claudeHistory = Claude Code 官方会话文件（~/.claude/projects）里发现的历史会话；
+// codexHistory = Codex 官方会话文件（~/.codex/sessions）里发现的历史会话。
+// 历史列表完全由官方文件决定，回复不改变其内容与状态。
+export type AgentListScope = 'mine' | 'claudeHistory' | 'codexHistory';
 
 // 查询该云电脑本机持久化的会话列表；可在网络恢复后再次请求。
 // scope 缺省为 mine（旧控制端不传即只看本软件的会话）。

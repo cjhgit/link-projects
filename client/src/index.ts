@@ -405,11 +405,14 @@ function connect() {
 const CLAUDE_DIR = join(homedir(), '.claude');
 const CLAUDE_HISTORY_FILE = join(CLAUDE_DIR, 'history.jsonl');
 const CLAUDE_PROJECTS_DIR = join(CLAUDE_DIR, 'projects');
-// Claude 历史在列表中最多展示的条数（按最近活动排序），避免历史会话过多拖垮列表与请求耗时
+// Codex 官方会话目录：按 年/月/日 分层，文件名 rollout-<时间戳>-<threadId>.jsonl
+const CODEX_SESSIONS_DIR = join(homedir(), '.codex', 'sessions');
+// 历史列表每个 tab 最多展示的条数（按最近活动排序），避免历史会话过多拖垮列表与请求耗时
 const MAX_EXTERNAL_SESSIONS = 300;
 
-// 持久化到 claude-sessions.json 的记录：claude 会话不存 messages（复用官方 jsonl），
-// codex 会话仍存（其 rollout 文件格式无官方保证）。协议快照中的 messages 是组装出来的视图。
+// 持久化到 claude-sessions.json 的记录：claude / codex 会话均不维护 messages（复用官方会话文件，
+// 实时解析）。旧版 codex 记录自带的 messages 保留作兜底（官方 rollout 已被清理时仍有内容可看）。
+// 协议快照中的 messages 是组装出来的视图。
 type StoredAgentSession = Omit<AgentSession, 'messages' | 'streaming'> & {
   messages?: AgentSession['messages'];
   origin?: AgentSession['origin'];
@@ -469,9 +472,7 @@ function parseClaudeJsonl(content: string): AgentSession['messages'] {
       if (text) role = 'assistant';
     }
     if (!role || !text.trim()) continue;
-    const last = messages[messages.length - 1];
-    if (last && last.role === role) last.content = `${last.content}\n\n${text}`;
-    else messages.push({ role, content: text, createdAt });
+    pushOrMerge(messages, role, text, createdAt);
   }
   return messages;
 }
@@ -483,6 +484,192 @@ async function readClaudeMessages(jsonlPath: string): Promise<AgentSession['mess
   } catch {
     return undefined;
   }
+}
+
+// ---------- Codex 官方会话（~/.codex/sessions/年/月/日/rollout-<ts>-<threadId>.jsonl） ----------
+
+// Codex rollout 里 CLI 注入的非用户输入内容（环境上下文 / 权限说明等），解析时跳过
+const CODEX_INJECTED_PREFIXES = ['<environment_context>', '<permissions', '<user_instructions>', '<app-context>', '<app-instructions>', '<turn_context>', '<user_shell>', '<IDE>', '# AGENTS.md'];
+
+// 解析 Codex rollout jsonl 为消息视图：只保留真实用户输入（input_text）与回复（output_text），
+// 跳过 developer 注入、reasoning、工具调用等；相邻同角色合并（与 Claude 解析口径一致）。
+function parseCodexJsonl(content: string): AgentSession['messages'] {
+  const messages: AgentSession['messages'] = [];
+  for (const line of content.split('\n')) {
+    if (!line.trim()) continue;
+    let event: any;
+    try {
+      event = JSON.parse(line);
+    } catch {
+      continue;
+    }
+    if (event?.type !== 'response_item') continue;
+    const payload = event?.payload;
+    if (payload?.type !== 'message' || !Array.isArray(payload?.content)) continue;
+    const timestamp = typeof event?.timestamp === 'string' ? Date.parse(event.timestamp) : NaN;
+    const createdAt = Number.isFinite(timestamp) ? timestamp : 0;
+    const text = payload.content
+      .filter((item: any) => typeof item?.text === 'string' && item.text
+        && (item?.type === 'input_text' || item?.type === 'output_text'))
+      .map((item: any) => item.text)
+      .join('\n\n');
+    if (!text.trim()) continue;
+    if (payload.role === 'user') {
+      const trimmed = text.trimStart();
+      if (CODEX_INJECTED_PREFIXES.some((prefix) => trimmed.startsWith(prefix))) continue;
+      pushOrMerge(messages, 'user', text, createdAt);
+    } else if (payload.role === 'assistant') {
+      pushOrMerge(messages, 'assistant', text, createdAt);
+    }
+  }
+  return messages;
+}
+
+// 相邻同角色的文本合并为一条，避免 UI 出现大量碎气泡（两个解析器共用）
+function pushOrMerge(messages: AgentSession['messages'], role: 'user' | 'assistant', text: string, createdAt: number): void {
+  const last = messages[messages.length - 1];
+  if (last && last.role === role) last.content = `${last.content}\n\n${text}`;
+  else messages.push({ role, content: text, createdAt });
+}
+
+async function readCodexMessages(jsonlPath: string): Promise<AgentSession['messages'] | undefined> {
+  try {
+    return parseCodexJsonl(await readFile(jsonlPath, 'utf8'));
+  } catch {
+    return undefined;
+  }
+}
+
+// 从 rollout 头部提取 cwd：session_meta / turn_context 的 payload.cwd。
+// session_meta 行含完整 instructions 可能很长，头部截断导致 JSON 解析失败时用正则兜底。
+function codexCwdFromHead(head: string): string | undefined {
+  for (const line of head.split('\n')) {
+    try {
+      const event = JSON.parse(line);
+      const cwd = event?.payload?.cwd ?? event?.cwd;
+      if (typeof cwd === 'string' && cwd) return cwd;
+    } catch { /* 截断行落到正则兜底 */ }
+  }
+  const m = head.match(/"cwd"\s*:\s*"([^"]+)"/);
+  return m ? m[1] : undefined;
+}
+
+// rollout 文件名：rollout-<时间戳>-<threadId>.jsonl 或 rollout-<时间戳>-<threadId>_<分支id>.jsonl。
+// 同一 thread 经 resume 会产生多个分片文件，各分片只记录自己那段对话（不包含被 resume 的历史），
+// 完整对话需按时间顺序合并全部分片；threadId 为文件名里下划线前的标准 UUID。
+const CODEX_ROLLOUT_RE = /^rollout-.*-([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})(?:_[0-9a-fA-F-]+)?\.jsonl$/;
+
+interface CodexThreadFiles {
+  threadId: string;
+  oldest: string; // 最老分片（首条用户输入在这里，用于标题）
+  newest: string; // 最新分片（jsonlPath 指向它，活动时间取其 mtime）
+  mtimeMs: number;
+}
+
+// Codex 会话目录按 年/月/日 分层且目录名即日期：倒序遍历（最新在前），
+// 收集 rollout 文件并按 thread 聚合，凑够 limit 个 thread 即停（磁盘上可能有数万个文件）。
+async function listCodexThreadFiles(limit: number): Promise<CodexThreadFiles[]> {
+  // 一个 thread 常有 1-3 个分片，多收一些文件再分组
+  const rawFiles: { threadId: string; path: string; name: string; mtimeMs: number }[] = [];
+  const wantFiles = limit * 3;
+  const years = (await readdirSafe(CODEX_SESSIONS_DIR)).sort().reverse();
+  for (const year of years) {
+    const months = (await readdirSafe(join(CODEX_SESSIONS_DIR, year))).sort().reverse();
+    for (const month of months) {
+      const days = (await readdirSafe(join(CODEX_SESSIONS_DIR, year, month))).sort().reverse();
+      for (const day of days) {
+        const dir = join(CODEX_SESSIONS_DIR, year, month, day);
+        let names: string[];
+        try {
+          names = (await readdir(dir, { withFileTypes: true })).filter((d) => d.isFile()).map((d) => d.name);
+        } catch { continue; }
+        for (const name of names) {
+          const m = CODEX_ROLLOUT_RE.exec(name);
+          if (!m) continue;
+          const path = join(dir, name);
+          try {
+            const st = await stat(path);
+            if (st.isFile()) rawFiles.push({ threadId: m[1], path, name, mtimeMs: st.mtimeMs });
+          } catch { /* 忽略失效文件 */ }
+          if (rawFiles.length >= wantFiles) break;
+        }
+        if (rawFiles.length >= wantFiles) break;
+      }
+      if (rawFiles.length >= wantFiles) break;
+    }
+    if (rawFiles.length >= wantFiles) break;
+  }
+  // 按 thread 聚合：文件名含时间戳，字符串排序即时间序
+  const byThread = new Map<string, typeof rawFiles>();
+  for (const file of rawFiles) {
+    const list = byThread.get(file.threadId) ?? [];
+    list.push(file);
+    byThread.set(file.threadId, list);
+  }
+  const threads: CodexThreadFiles[] = [];
+  for (const [threadId, files] of byThread) {
+    files.sort((a, b) => a.name.localeCompare(b.name));
+    threads.push({
+      threadId,
+      oldest: files[0].path,
+      newest: files[files.length - 1].path,
+      mtimeMs: Math.max(...files.map((f) => f.mtimeMs)),
+    });
+  }
+  threads.sort((a, b) => b.mtimeMs - a.mtimeMs);
+  return threads.slice(0, limit);
+}
+
+async function readdirSafe(dir: string): Promise<string[]> {
+  try {
+    return (await readdir(dir, { withFileTypes: true })).filter((d) => d.isDirectory()).map((d) => d.name);
+  } catch {
+    return [];
+  }
+}
+
+// threadId -> 全部分片路径（合并完整对话用）。全目录扫描一次后缓存，
+// 后续详情读取直接命中（readdir 文件名匹配为主，不逐文件 stat）。
+const codexThreadPathsCache = new Map<string, string[]>();
+
+async function findCodexAllRollouts(threadId: string): Promise<string[]> {
+  if (!/^[0-9a-fA-F-]{8,64}$/.test(threadId)) return [];
+  const cached = codexThreadPathsCache.get(threadId);
+  if (cached) return cached;
+  const paths: string[] = [];
+  const walk = async (dir: string, depth: number): Promise<void> => {
+    let entries;
+    try {
+      entries = await readdir(dir, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const entry of entries) {
+      if (entry.isDirectory()) {
+        if (depth < 3) await walk(join(dir, entry.name), depth + 1);
+      } else if (entry.isFile()) {
+        const m = CODEX_ROLLOUT_RE.exec(entry.name);
+        if (m && m[1] === threadId) paths.push(join(dir, entry.name));
+      }
+    }
+  };
+  await walk(CODEX_SESSIONS_DIR, 0);
+  paths.sort((a, b) => a.localeCompare(b)); // 文件名含时间戳，排序即对话顺序
+  codexThreadPathsCache.set(threadId, paths);
+  return paths;
+}
+
+// 读取一个 thread 的完整对话：按时间顺序合并全部分片后解析
+async function readCodexThreadMessages(threadId: string): Promise<AgentSession['messages'] | undefined> {
+  const paths = await findCodexAllRollouts(threadId);
+  if (paths.length === 0) return undefined;
+  const messages: AgentSession['messages'] = [];
+  for (const path of paths) {
+    const part = await readCodexMessages(path);
+    if (!part) continue;
+    for (const item of part) pushOrMerge(messages, item.role, item.content, item.createdAt);
+  }
+  return messages;
 }
 
 interface ClaudeHistoryEntry {
@@ -539,6 +726,15 @@ async function loadAgentSessions(): Promise<void> {
       }
       if (session.origin !== 'external') session.origin = 'link';
     }
+    // codex 旧记录改由官方 rollout 解析消息：按 externalId（thread id）回填最新分片路径。
+    // 旧 messages 副本保留作兜底（rollout 已被官方清理时详情仍有内容可看），不再更新。
+    for (const session of agentSessions) {
+      if (session.agent === 'codex' && !session.jsonlPath && session.externalId
+        && session.state !== 'running') {
+        const paths = await findCodexAllRollouts(session.externalId);
+        if (paths.length > 0) session.jsonlPath = paths[paths.length - 1];
+      }
+    }
     // client 重启意味着旧 CLI 子进程不可能仍由本实例托管，避免永久显示“运行中”。
     for (const session of agentSessions) {
       if (session.state === 'running') {
@@ -572,12 +768,12 @@ function summarySnapshot(session: StoredAgentSession): AgentSession {
   return { ...agentSnapshot(session), messages: [] };
 }
 
-// 运行中的 claude 任务视图：启动时的消息基线 + 本轮输入 + 实时增量文本。
-// 只存在于内存（不落盘），任务结束后以官方 jsonl 解析结果为准。
+// 运行中的任务视图（claude / codex 通用）：启动时的消息基线 + 本轮输入 + 实时增量文本。
+// 只存在于内存（不落盘），任务结束后以官方会话文件的解析结果为准。
 const activeRuns = new Map<string, { baseMessages: AgentSession['messages']; prompt: string; streamedText: string }>();
 
-// 运行中快照：基线消息 + 本轮输入（官方 jsonl 写入前的兜底显示）+ streaming 增量
-function runningClaudeSnapshot(session: StoredAgentSession): AgentSession {
+// 运行中快照：基线消息 + 本轮输入（官方文件写入前的兜底显示）+ streaming 增量
+function runningSnapshot(session: StoredAgentSession): AgentSession {
   const run = activeRuns.get(session.sessionId);
   const messages: AgentSession['messages'] = run
     ? JSON.parse(JSON.stringify(run.baseMessages))
@@ -594,18 +790,19 @@ function runningClaudeSnapshot(session: StoredAgentSession): AgentSession {
   return snapshot;
 }
 
-// 详情快照：claude = 实时解析官方 jsonl；codex = 本软件维护的 messages
+// 详情快照：优先实时解析官方会话文件（claude jsonl / codex 全分片合并的 rollout）；
+// codex 旧记录 rollout 已清理时回退本软件曾维护的 messages 副本。
 async function detailSnapshot(session: StoredAgentSession): Promise<AgentSession> {
-  if (session.agent === 'codex') {
-    return { ...agentSnapshot(session), messages: session.messages ?? [] };
-  }
-  if (session.state === 'running') return runningClaudeSnapshot(session);
-  const messages = session.jsonlPath ? await readClaudeMessages(session.jsonlPath) : undefined;
-  return { ...agentSnapshot(session), messages: messages ?? [] };
+  if (session.state === 'running') return runningSnapshot(session);
+  const messages = session.agent === 'codex'
+    ? await readCodexThreadMessages(session.externalId ?? session.sessionId)
+    : session.jsonlPath ? await readClaudeMessages(session.jsonlPath) : undefined;
+  if (messages !== undefined) return { ...agentSnapshot(session), messages };
+  return { ...agentSnapshot(session), messages: session.messages ?? [] };
 }
 
-// 会话标题：清洗斜杠命令的 XML 标签等噪音，空则回退短 id
-function claudeSessionTitle(text: string, sessionId: string): string {
+// 会话标题：清洗斜杠命令 / 环境注入的 XML 标签等噪音，空则回退短 id
+function agentSessionTitle(text: string, sessionId: string): string {
   const cleaned = text
     .replace(/<command-[a-z-]+>[\s\S]*?<\/command-[a-z-]+>/g, ' ')
     .replace(/<[^>]+>/g, ' ')
@@ -620,7 +817,7 @@ function externalSessionFromHistory(sessionId: string, entry: ClaudeHistoryEntry
     sessionId,
     agent: 'claude',
     origin: 'external',
-    title: claudeSessionTitle(entry.display, sessionId),
+    title: agentSessionTitle(entry.display, sessionId),
     cwd: entry.project,
     state: 'completed',
     createdAt: entry.timestamp || mtimeMs,
@@ -651,8 +848,7 @@ async function discoverExternalClaudeSessions(): Promise<StoredAgentSession[]> {
   } catch {
     return [];
   }
-  // 仅排除本软件发起的会话（正常不会与官方文件重复，防御性排除避免重复展示）
-  const known = new Set(agentSessions.filter((item) => item.origin !== 'external').map((item) => item.sessionId));
+  // 完全由磁盘上的官方 jsonl 决定（含本软件发起的）；与「会话」页可能重复出现是预期
   // 先收集全部候选文件按 mtime 排序，只对最近的一批读头部解析，不为老会话做文件 IO
   const candidates: { sessionId: string; path: string; mtimeMs: number }[] = [];
   await Promise.all(dirs.map(async (dir) => {
@@ -664,7 +860,6 @@ async function discoverExternalClaudeSessions(): Promise<StoredAgentSession[]> {
     await Promise.all(files.map(async (name) => {
       if (!name.endsWith('.jsonl')) return;
       const sessionId = name.slice(0, -'.jsonl'.length);
-      if (known.has(sessionId)) return;
       const path = join(CLAUDE_PROJECTS_DIR, dir.name, name);
       try {
         const st = await stat(path);
@@ -680,8 +875,8 @@ async function discoverExternalClaudeSessions(): Promise<StoredAgentSession[]> {
     if (!cwd) return undefined; // 恢复对话依赖 cwd 定位官方会话文件
     const entry = history.get(item.sessionId);
     const title = entry?.display
-      ? claudeSessionTitle(entry.display, item.sessionId)
-      : claudeSessionTitle(parseClaudeJsonl(head).find((m) => m.role === 'user')?.content ?? '', item.sessionId);
+      ? agentSessionTitle(entry.display, item.sessionId)
+      : agentSessionTitle(parseClaudeJsonl(head).find((m) => m.role === 'user')?.content ?? '', item.sessionId);
     return {
       sessionId: item.sessionId,
       agent: 'claude',
@@ -734,7 +929,7 @@ async function findClaudeSessionOnDisk(sessionId: string): Promise<StoredAgentSe
         sessionId,
         agent: 'claude',
         origin: 'external',
-        title: claudeSessionTitle(firstUser?.content ?? '', sessionId),
+        title: agentSessionTitle(firstUser?.content ?? '', sessionId),
         cwd,
         state: 'completed',
         createdAt: st.mtimeMs,
@@ -746,7 +941,7 @@ async function findClaudeSessionOnDisk(sessionId: string): Promise<StoredAgentSe
   return undefined;
 }
 
-// 查单个外部会话（agent-status / agent-run 复用）；已是内部记录的返回 undefined。
+// 查单个外部 Claude 会话（agent-status / agent-run 复用）；已是内部记录的返回 undefined。
 // history 线索优先（有首句输入做标题），找不到再按 sessionId 扫描磁盘。
 async function findExternalClaudeSession(sessionId: string): Promise<StoredAgentSession | undefined> {
   if (agentSessions.some((item) => item.sessionId === sessionId)) return undefined;
@@ -763,6 +958,73 @@ async function findExternalClaudeSession(sessionId: string): Promise<StoredAgent
   return findClaudeSessionOnDisk(sessionId);
 }
 
+// 发现 Codex 历史会话：以磁盘上的官方 rollout 为准，按 thread 聚合、mtime 取最新一批。
+// 与 Claude 历史同理：只在请求列表时动态生成、不写入 claude-sessions.json、回复不改变此列表。
+async function discoverExternalCodexSessions(): Promise<StoredAgentSession[]> {
+  // 完全由磁盘上的官方 rollout 决定（含本软件发起、以及继续过对话的），
+  // 与「会话」页可能重复出现是预期：历史只看官方文件，不管会话由谁发起
+  const threads = await listCodexThreadFiles(MAX_EXTERNAL_SESSIONS);
+  const found = await Promise.all(threads.map(async (item) => {
+    // cwd / 标题线索读最老分片（首条用户输入在那里），jsonlPath 指向最新分片
+    const head = readFileHead(item.oldest, 256 * 1024);
+    const cwd = codexCwdFromHead(head);
+    if (!cwd) return undefined; // 恢复对话依赖 cwd 定位工作目录
+    let firstUser = parseCodexJsonl(head).find((m) => m.role === 'user');
+    if (!firstUser && item.newest !== item.oldest) {
+      // 最老分片头部只有长篇注入指令（如 AGENTS.md）时，取最新分片的首条输入做标题
+      firstUser = parseCodexJsonl(readFileHead(item.newest, 256 * 1024)).find((m) => m.role === 'user');
+    }
+    return {
+      sessionId: item.threadId,
+      agent: 'codex',
+      origin: 'external',
+      // threadId 即 codex resume 所需的 id
+      externalId: item.threadId,
+      title: agentSessionTitle(firstUser?.content ?? '', item.threadId),
+      cwd,
+      state: 'completed',
+      createdAt: item.mtimeMs,
+      updatedAt: item.mtimeMs,
+      jsonlPath: item.newest,
+    } as StoredAgentSession;
+  }));
+  return found.filter((item): item is StoredAgentSession => item !== undefined);
+}
+
+// 查单个外部 Codex 会话：按 threadId 定位全部分片后组装记录
+async function findExternalCodexSession(threadId: string): Promise<StoredAgentSession | undefined> {
+  if (agentSessions.some((item) => item.sessionId === threadId || item.externalId === threadId)) return undefined;
+  const paths = await findCodexAllRollouts(threadId);
+  if (paths.length === 0) return undefined;
+  try {
+    const head = readFileHead(paths[0], 256 * 1024);
+    const cwd = codexCwdFromHead(head);
+    if (!cwd) return undefined;
+    const firstUser = parseCodexJsonl(head).find((m) => m.role === 'user');
+    const newest = paths[paths.length - 1];
+    const st = await stat(newest);
+    return {
+      sessionId: threadId,
+      agent: 'codex',
+      origin: 'external',
+      externalId: threadId,
+      title: agentSessionTitle(firstUser?.content ?? '', threadId),
+      cwd,
+      state: 'completed',
+      createdAt: st.mtimeMs,
+      updatedAt: st.mtimeMs,
+      jsonlPath: newest,
+    };
+  } catch {
+    return undefined;
+  }
+}
+
+// 按会话 ID 查外部会话（claude 与 codex 的 id 均为 uuid 形态、无法从形态区分，顺序查找）
+async function findExternalAgentSession(sessionId: string): Promise<StoredAgentSession | undefined> {
+  return (await findExternalClaudeSession(sessionId)) ?? (await findExternalCodexSession(sessionId));
+}
+
 function replyAgent(reqId: string, targetId: string, sessions: AgentSession[]) {
   reply({ type: 'agent-sessions', reqId, targetId, sessions });
 }
@@ -770,11 +1032,11 @@ function replyAgent(reqId: string, targetId: string, sessions: AgentSession[]) {
 function handleAgentList(msg: AgentListMsg) {
   // 最近更新的排在前面；列表不依赖 controller 保留任何状态。
   void (async () => {
-    // history 页：只看官方记录里发现、尚未在本软件继续过对话的外部会话；
-    // 默认页：本软件的会话记录（含已从 history 导入并继续过的）
-    const list = msg.scope === 'history'
-      ? await discoverExternalClaudeSessions()
-      : [...agentSessions].sort((a, b) => b.updatedAt - a.updatedAt);
+    // 历史 tab：完全由官方会话文件决定；默认 tab：本软件的会话记录（含从历史导入并继续过的）
+    let list: StoredAgentSession[];
+    if (msg.scope === 'claudeHistory') list = await discoverExternalClaudeSessions();
+    else if (msg.scope === 'codexHistory') list = await discoverExternalCodexSessions();
+    else list = [...agentSessions].sort((a, b) => b.updatedAt - a.updatedAt);
     replyAgent(msg.reqId, msg.targetId, list.map(summarySnapshot));
   })();
 }
@@ -782,7 +1044,7 @@ function handleAgentList(msg: AgentListMsg) {
 function handleAgentStatus(msg: AgentStatusMsg) {
   void (async () => {
     const session = agentSessions.find((item) => item.sessionId === msg.sessionId)
-      ?? (await findExternalClaudeSession(msg.sessionId));
+      ?? (await findExternalAgentSession(msg.sessionId));
     replyAgent(msg.reqId, msg.targetId, session ? [await detailSnapshot(session)] : []);
   })();
 }
@@ -809,12 +1071,12 @@ async function handleAgentRun(msg: AgentRunMsg) {
 
   let session: StoredAgentSession | undefined;
   if (msg.sessionId) session = agentSessions.find((item) => item.sessionId === msg.sessionId);
-  // 内部记录没有但官方记录里有：外部会话首次继续对话，转为内部记录以便跟踪状态
+  // 内部记录没有但官方文件里有：外部会话（Claude 历史 / Codex 历史）首次继续对话，转为内部记录
   if (msg.sessionId && !session) {
-    session = await findExternalClaudeSession(msg.sessionId);
+    session = await findExternalAgentSession(msg.sessionId);
     if (session) {
       agentSessions.push(session);
-      console.log(`[agent] 导入外部 Claude Code 会话 ${session.sessionId} (cwd: ${session.cwd})`);
+      console.log(`[agent] 导入外部${session.agent === 'codex' ? ' Codex' : ' Claude Code'} 会话 ${session.sessionId} (cwd: ${session.cwd})`);
     }
   }
   if (msg.sessionId && !session) {
@@ -856,20 +1118,19 @@ async function handleAgentRun(msg: AgentRunMsg) {
   // 云电脑 Agent 没有可供用户确认的本地交互界面；显式跳过 CLI 的逐次权限询问，
   // 使其能按用户在控制端发起的任务读取和修改工作目录中的文件。
   const kind: AgentKind = session.agent ?? 'claude';
-  if (kind !== 'codex') {
-    // claude：消息一律以官方 jsonl 为准、本软件不维护；补记路径并缓存本轮运行视图的基线
-    if (!session.jsonlPath) session.jsonlPath = claudeJsonlPath(session.cwd, session.sessionId);
-    const base = session.jsonlPath ? await readClaudeMessages(session.jsonlPath) : undefined;
-    activeRuns.set(session.sessionId, { baseMessages: base ?? [], prompt, streamedText: '' });
-  } else {
-    // codex：仍由本软件维护消息记录（其 rollout 文件格式无官方保证）
-    (session.messages ??= []).push({ role: 'user', content: prompt, createdAt: now });
+  // 消息一律以官方会话文件为准、本软件不维护。claude 按 cwd 推导路径；
+  // codex 的 rollout 路径无法预知（文件名含时间戳），close 时按 thread id 回填。
+  if (kind !== 'codex' && !session.jsonlPath) {
+    session.jsonlPath = claudeJsonlPath(session.cwd, session.sessionId);
   }
+  // 运行期间的内存视图基线：官方文件已解析的内容（codex 旧记录无 rollout 时用曾维护的副本兜底）
+  const base = kind === 'codex'
+    ? (await readCodexThreadMessages(session.externalId ?? session.sessionId)) ?? session.messages
+    : session.jsonlPath ? await readClaudeMessages(session.jsonlPath) : undefined;
+  activeRuns.set(session.sessionId, { baseMessages: JSON.parse(JSON.stringify(base ?? [])), prompt, streamedText: '' });
   persistAgentSessions().catch((err) => console.error(`[agent] 保存会话失败: ${err.message}`));
   // 立即回 running 快照；网络中断时控制端可稍后用 agent-status / agent-list 拉取最终结果。
-  replyAgent(msg.reqId, msg.targetId, [
-    kind === 'codex' ? { ...agentSnapshot(session), messages: session.messages ?? [] } : runningClaudeSnapshot(session),
-  ]);
+  replyAgent(msg.reqId, msg.targetId, [runningSnapshot(session)]);
 
   let file: string;
   let args: string[];
@@ -897,13 +1158,8 @@ async function handleAgentRun(msg: AgentRunMsg) {
   let turnCompleted = false; // codex：收到过 turn.completed 则视为执行成功（stderr 可能有无害杂音）
   const publishStream = () => {
     session!.updatedAt = Date.now();
-    // codex 的消息记录在变需要落盘；claude 的增量只存在于内存视图，断线恢复以官方 jsonl 为准。
-    if (kind === 'codex') {
-      persistAgentSessions().catch((err) => console.error(`[agent] 保存流式输出失败: ${err.message}`));
-      replyAgent(msg.reqId, msg.targetId, [{ ...agentSnapshot(session!), messages: session!.messages ?? [] }]);
-    } else {
-      replyAgent(msg.reqId, msg.targetId, [runningClaudeSnapshot(session!)]);
-    }
+    // 增量只存在于内存视图（claude / codex 一致），断线恢复以官方会话文件的解析结果为准
+    replyAgent(msg.reqId, msg.targetId, [runningSnapshot(session!)]);
   };
   const consumeStreamLine = (line: string) => {
     if (!line.trim()) return;
@@ -920,8 +1176,9 @@ async function handleAgentRun(msg: AgentRunMsg) {
         } else if (event?.type === 'item.completed' && event?.item?.type === 'agent_message') {
           const text = typeof event?.item?.text === 'string' ? event.item.text : '';
           if (text) {
-            // codex 的 item.completed 携带整条消息（无 token 级增量），一次成条
-            (session!.messages ??= []).push({ role: 'assistant', content: text, createdAt: Date.now() });
+            // codex 的 item.completed 携带整条消息（无 token 级增量），一次成条进内存视图
+            const run = activeRuns.get(session!.sessionId);
+            if (run) run.streamedText += text;
             streamedText += text;
             publishStream();
           }
@@ -993,24 +1250,30 @@ async function handleAgentRun(msg: AgentRunMsg) {
       session!.state = 'failed';
       session!.error = stderr.trim() || `${kind === 'codex' ? 'Codex' : 'Claude Code'} 退出码 ${code ?? '未知'}`;
     }
-    // claude 的最终消息以官方 jsonl 为准；若 jsonl 缺失或尚未包含本轮输入
-    // （CLI 启动失败 / 落盘延迟），回退用本轮运行视图组装，保证控制端不丢本次对话。
+    // 最终消息以官方会话文件为准（claude jsonl / codex 全分片 rollout）；codex 的 rollout
+    // 此刻才可定位（文件名含时间戳），按 thread id 找全分片、jsonlPath 回填最新一个。
+    // 若文件缺失或尚未包含本轮输入（CLI 启动失败 / 落盘延迟），
+    // 回退用本轮运行视图组装，保证控制端不丢本次对话。
+    if (kind === 'codex' && session!.externalId) {
+      const paths = await findCodexAllRollouts(session!.externalId);
+      if (paths.length > 0) session!.jsonlPath = paths[paths.length - 1];
+    }
     let finalMessages: AgentSession['messages'] | undefined;
     if (kind === 'codex') {
-      finalMessages = session!.messages ?? [];
-    } else {
-      const run = activeRuns.get(session!.sessionId);
-      finalMessages = session!.jsonlPath ? await readClaudeMessages(session!.jsonlPath) : undefined;
-      if (run && (finalMessages === undefined || !finalMessages.some((item) => item.role === 'user' && item.content === run.prompt))) {
-        const replyText = run.streamedText || result;
-        finalMessages = [
-          ...run.baseMessages,
-          { role: 'user', content: run.prompt, createdAt: now },
-          ...(replyText ? [{ role: 'assistant' as const, content: replyText, createdAt: finished }] : []),
-        ];
-      }
-      activeRuns.delete(session!.sessionId);
+      finalMessages = await readCodexThreadMessages(session!.externalId ?? session!.sessionId);
+    } else if (session!.jsonlPath) {
+      finalMessages = await readClaudeMessages(session!.jsonlPath);
     }
+    const run = activeRuns.get(session!.sessionId);
+    if (run && (finalMessages === undefined || !finalMessages.some((item) => item.role === 'user' && item.content === run.prompt))) {
+      const replyText = run.streamedText || result;
+      finalMessages = [
+        ...run.baseMessages,
+        { role: 'user', content: run.prompt, createdAt: now },
+        ...(replyText ? [{ role: 'assistant' as const, content: replyText, createdAt: finished }] : []),
+      ];
+    }
+    activeRuns.delete(session!.sessionId);
     try { await persistAgentSessions(); } catch (err: any) { console.error(`[agent] 保存会话失败: ${err.message}`); }
     // 流式阶段已推送 running；退出时必须再推送最终 completed / failed，控制端才能关闭 loading。
     replyAgent(msg.reqId, msg.targetId, [{ ...agentSnapshot(session!), messages: finalMessages ?? [] }]);

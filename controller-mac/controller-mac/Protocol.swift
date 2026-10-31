@@ -84,10 +84,11 @@ nonisolated enum AgentSessionOrigin: String, Equatable {
 }
 
 // 会话列表范围：mine = 本软件发起或继续过对话的会话（默认）；
-// history = 官方记录里发现、尚未在本软件继续过对话的外部会话
+// claudeHistory / codexHistory = 官方会话文件里发现的历史会话（完全由官方文件决定，回复不改变）
 nonisolated enum AgentListScope: String, Equatable {
     case mine
-    case history
+    case claudeHistory
+    case codexHistory
 }
 
 nonisolated struct AgentMessageInfo: Identifiable, Equatable {

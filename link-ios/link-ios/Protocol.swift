@@ -77,8 +77,8 @@ nonisolated enum AgentKind: String, Equatable {
 nonisolated enum AgentSessionOrigin: String, Equatable { case link; case external }
 
 // 会话列表范围：mine = 本软件发起或继续过对话的会话（默认）；
-// history = 官方记录里发现、尚未在本软件继续过对话的外部会话
-nonisolated enum AgentListScope: String, Equatable { case mine; case history }
+// claudeHistory / codexHistory = 官方会话文件里发现的历史会话（完全由官方文件决定，回复不改变）
+nonisolated enum AgentListScope: String, Equatable { case mine; case claudeHistory; case codexHistory }
 
 nonisolated struct AgentMessageInfo: Identifiable, Equatable { let role: String; let content: String; let createdAt: Double; var id: String { "\(role)-\(createdAt)-\(content.hashValue)" } }
 
@@ -283,7 +283,8 @@ nonisolated enum OutgoingMessage {
     static func fileDownload(reqId: String, targetId: String, path: String) -> String { json(["type": "file-download", "reqId": reqId, "targetId": targetId, "path": path]) }
 
     static func agentList(reqId: String, targetId: String, scope: AgentListScope = .mine) -> String { json(["type": "agent-list", "reqId": reqId, "targetId": targetId, "scope": scope.rawValue]) }
-    static func agentRun(reqId: String, targetId: String, prompt: String, sessionId: String?, cwd: String?) -> String { var value: [String: Any] = ["type": "agent-run", "reqId": reqId, "targetId": targetId, "prompt": prompt]; if let sessionId { value["sessionId"] = sessionId }; if let cwd, !cwd.isEmpty { value["cwd"] = cwd }; return json(value) }
+    // agent 仅新建会话时传（继续会话时 client 以会话记录保存的类型为准）
+    static func agentRun(reqId: String, targetId: String, prompt: String, sessionId: String?, cwd: String?, agent: AgentKind? = nil) -> String { var value: [String: Any] = ["type": "agent-run", "reqId": reqId, "targetId": targetId, "prompt": prompt]; if let sessionId { value["sessionId"] = sessionId }; if let cwd, !cwd.isEmpty { value["cwd"] = cwd }; if let agent { value["agent"] = agent.rawValue }; return json(value) }
     static func agentStatus(reqId: String, targetId: String, sessionId: String) -> String { json(["type": "agent-status", "reqId": reqId, "targetId": targetId, "sessionId": sessionId]) }
     static func agentDelete(reqId: String, targetId: String, sessionId: String) -> String { json(["type": "agent-delete", "reqId": reqId, "targetId": targetId, "sessionId": sessionId]) }
 
