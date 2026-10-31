@@ -63,6 +63,13 @@ private struct ServerListView: View {
                 }
             }
         }
+        // 首页底部常显 App 版本号，便于排查时对照
+        .safeAreaInset(edge: .bottom) {
+            Text(Self.appVersionLabel)
+                .font(.caption2)
+                .foregroundStyle(.tertiary)
+                .padding(.bottom, 4)
+        }
         .navigationTitle("服务器")
         .toolbar {
             ToolbarItem(placement: .topBarTrailing) {
@@ -90,6 +97,14 @@ private struct ServerListView: View {
         } message: { _ in
             Text("将断开该服务器的连接并移除其配置")
         }
+    }
+
+    // App 版本（Info.plist 的 CFBundleShortVersionString / CFBundleVersion，即项目的 MARKETING_VERSION）
+    private static var appVersionLabel: String {
+        let info = Bundle.main.infoDictionary ?? [:]
+        let version = info["CFBundleShortVersionString"] as? String ?? ""
+        let build = info["CFBundleVersion"] as? String ?? ""
+        return build.isEmpty ? "v\(version)" : "v\(version) (\(build))"
     }
 
     private func serverRow(_ server: Server) -> some View {

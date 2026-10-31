@@ -368,11 +368,12 @@ final class LinkSession: NSObject, URLSessionWebSocketDelegate {
 
     // MARK: - Agent 会话（Claude Code / Codex，会话数据在 client 本机持久化，不在 server 保存）
 
-    func listAgentSessions(targetId: String, completion: @escaping ([AgentSessionInfo]) -> Void) {
+    // scope：mine = 本软件的会话（默认），history = Claude Code 官方记录里发现的外部会话
+    func listAgentSessions(targetId: String, scope: AgentListScope = .mine, completion: @escaping ([AgentSessionInfo]) -> Void) {
         guard state == .connected else { completion([]); return }
         let reqId = UUID().uuidString
         agentCallbacks[reqId] = completion
-        send(OutgoingMessage.agentList(reqId: reqId, targetId: targetId))
+        send(OutgoingMessage.agentList(reqId: reqId, targetId: targetId, scope: scope))
     }
 
     func runAgent(targetId: String, prompt: String, sessionId: String? = nil, cwd: String? = nil, agent: AgentKind? = nil, completion: @escaping ([AgentSessionInfo]) -> Void) {

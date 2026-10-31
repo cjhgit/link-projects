@@ -62,10 +62,40 @@ nonisolated enum FileOutcome<Value> {
     case failed(String)
 }
 
-// Claude Code 会话快照；真实持久化文件仅位于云电脑 client 的 ~/.link-projects/claude-sessions.json。
+// Agent 会话快照（Claude Code / Codex CLI）；真实持久化文件仅位于云电脑 client 的 ~/.link-projects/claude-sessions.json。
 nonisolated enum AgentSessionState: String, Equatable { case running; case completed; case failed }
+
+// 底层 CLI：claude = Claude Code（默认，旧记录无 agent 字段也视为它），codex = OpenAI Codex
+nonisolated enum AgentKind: String, Equatable {
+    case claude
+    case codex
+
+    var displayName: String { self == .codex ? "Codex" : "Claude Code" }
+}
+
+// 会话来源：link = 本软件发起；external = 从 Claude Code 官方记录中发现的外部会话
+nonisolated enum AgentSessionOrigin: String, Equatable { case link; case external }
+
+// 会话列表范围：mine = 本软件发起或继续过对话的会话（默认）；
+// history = 官方记录里发现、尚未在本软件继续过对话的外部会话
+nonisolated enum AgentListScope: String, Equatable { case mine; case history }
+
 nonisolated struct AgentMessageInfo: Identifiable, Equatable { let role: String; let content: String; let createdAt: Double; var id: String { "\(role)-\(createdAt)-\(content.hashValue)" } }
-nonisolated struct AgentSessionInfo: Identifiable, Equatable { let sessionId: String; let title: String; let cwd: String?; let state: AgentSessionState; let createdAt: Double; let updatedAt: Double; let error: String?; let messages: [AgentMessageInfo]; var id: String { sessionId } }
+
+nonisolated struct AgentSessionInfo: Identifiable, Equatable {
+    let sessionId: String
+    let agent: AgentKind
+    let origin: AgentSessionOrigin // 旧记录 / 缺省解析为 link
+    let title: String
+    let cwd: String?
+    let state: AgentSessionState
+    let createdAt: Double
+    let updatedAt: Double
+    let error: String?
+    let streaming: String? // 运行中尚未落盘的实时增量文本；与 messages 分开渲染为“生成中”气泡
+    let messages: [AgentMessageInfo] // agent-list 只返回摘要（空）；选中会话后由 agent-status 拉取完整消息
+    var id: String { sessionId }
+}
 
 // 项目（常用目录）快照；真实持久化文件仅位于云电脑 client 的 ~/.link-projects/projects.json
 nonisolated struct ProjectInfo: Identifiable, Equatable { let projectId: String; let name: String; let path: String; let createdAt: Double; let updatedAt: Double; var id: String { projectId } }
@@ -195,7 +225,7 @@ nonisolated enum IncomingMessage {
             )
         case "agent-sessions":
             let sessions = (obj["sessions"] as? [[String: Any]] ?? []).map { item in
-                AgentSessionInfo(sessionId: item["sessionId"] as? String ?? "", title: item["title"] as? String ?? "未命名会话", cwd: item["cwd"] as? String, state: AgentSessionState(rawValue: item["state"] as? String ?? "") ?? .failed, createdAt: item["createdAt"] as? Double ?? 0, updatedAt: item["updatedAt"] as? Double ?? 0, error: item["error"] as? String, messages: (item["messages"] as? [[String: Any]] ?? []).map { AgentMessageInfo(role: $0["role"] as? String ?? "assistant", content: $0["content"] as? String ?? "", createdAt: $0["createdAt"] as? Double ?? 0) })
+                AgentSessionInfo(sessionId: item["sessionId"] as? String ?? "", agent: AgentKind(rawValue: item["agent"] as? String ?? "") ?? .claude, origin: AgentSessionOrigin(rawValue: item["origin"] as? String ?? "") ?? .link, title: item["title"] as? String ?? "未命名会话", cwd: item["cwd"] as? String, state: AgentSessionState(rawValue: item["state"] as? String ?? "") ?? .failed, createdAt: item["createdAt"] as? Double ?? 0, updatedAt: item["updatedAt"] as? Double ?? 0, error: item["error"] as? String, streaming: item["streaming"] as? String, messages: (item["messages"] as? [[String: Any]] ?? []).map { AgentMessageInfo(role: $0["role"] as? String ?? "assistant", content: $0["content"] as? String ?? "", createdAt: $0["createdAt"] as? Double ?? 0) })
             }
             return .agentSessions(reqId: obj["reqId"] as? String ?? "", targetId: obj["targetId"] as? String ?? "", sessions: sessions)
         case "projects":
@@ -252,7 +282,7 @@ nonisolated enum OutgoingMessage {
     static func fileUploadFinish(reqId: String, targetId: String) -> String { json(["type": "file-upload-finish", "reqId": reqId, "targetId": targetId]) }
     static func fileDownload(reqId: String, targetId: String, path: String) -> String { json(["type": "file-download", "reqId": reqId, "targetId": targetId, "path": path]) }
 
-    static func agentList(reqId: String, targetId: String) -> String { json(["type": "agent-list", "reqId": reqId, "targetId": targetId]) }
+    static func agentList(reqId: String, targetId: String, scope: AgentListScope = .mine) -> String { json(["type": "agent-list", "reqId": reqId, "targetId": targetId, "scope": scope.rawValue]) }
     static func agentRun(reqId: String, targetId: String, prompt: String, sessionId: String?, cwd: String?) -> String { var value: [String: Any] = ["type": "agent-run", "reqId": reqId, "targetId": targetId, "prompt": prompt]; if let sessionId { value["sessionId"] = sessionId }; if let cwd, !cwd.isEmpty { value["cwd"] = cwd }; return json(value) }
     static func agentStatus(reqId: String, targetId: String, sessionId: String) -> String { json(["type": "agent-status", "reqId": reqId, "targetId": targetId, "sessionId": sessionId]) }
     static func agentDelete(reqId: String, targetId: String, sessionId: String) -> String { json(["type": "agent-delete", "reqId": reqId, "targetId": targetId, "sessionId": sessionId]) }

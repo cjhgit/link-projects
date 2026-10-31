@@ -13,6 +13,13 @@ struct AgentView: View {
     @State private var sending = false
     @State private var confirmDelete = false
     @State private var deleteCandidate: AgentSessionInfo?
+    // 列表范围：mine = 本软件发起或继续过对话的会话（默认）；history = Claude Code 官方记录里的历史对话（回复不改变此列表）
+    @State private var scope: AgentListScope = .mine
+    @State private var copiedId = false // session id 复制成功后的短暂反馈
+    @State private var resumeSheet = false // 按 Session ID 继续对话
+    @State private var resumeId = ""
+    @State private var resumeError: String?
+    @State private var resuming = false
 
     private var targetId: String? {
         guard let id = session.currentTarget, id != LinkSession.serverTargetId,
@@ -50,6 +57,19 @@ struct AgentView: View {
             .onChange(of: session.currentTarget) { _, _ in
                 if let current = self.targetId { refresh(current) }
             }
+            .sheet(isPresented: $resumeSheet) {
+                if let current = self.targetId { resumeSheetView(current) }
+            }
+            // 切换「会话 / Claude 历史」：换一份列表并清空选中态
+            .onChange(of: scope) { _, _ in
+                selectedId = nil
+                creating = false
+                if let current = self.targetId { refresh(current) }
+            }
+            // 列表只带摘要；选中会话后拉取完整消息（claude 会话由 client 实时解析官方 jsonl）
+            .onChange(of: selectedId) { _, _ in
+                if let current = self.targetId, selectedId != nil { loadDetail(current) }
+            }
         } else {
             ContentUnavailableView("请选择在线云电脑", systemImage: "desktopcomputer", description: Text("Agent 仅运行在在线客户端。"))
         }
@@ -57,19 +77,36 @@ struct AgentView: View {
 
     private func header(_ targetId: String) -> some View {
         HStack {
-            Text(selected?.title ?? (creating ? "新建会话" : "会话"))
+            if selected != nil || creating {
+                Button {
+                    selectedId = nil
+                    creating = false
+                    prompt = ""
+                } label: { Image(systemName: "chevron.left") }
+                .accessibilityLabel("返回列表")
+            }
+            Text(selected?.title ?? (creating ? "新建会话" : scope == .history ? "Claude 历史" : "会话"))
                 .font(.headline).lineLimit(1)
             Spacer()
             if creating {
                 Button("取消") { creating = false; prompt = "" }
             }
-            Button {
-                selectedId = nil
-                creating = true
-                prompt = ""
-                cwd = ""
+            Menu {
+                Button {
+                    // 新建属于「会话」页；从 Claude 历史页点 + 自动切回
+                    scope = .mine
+                    selectedId = nil
+                    creating = true
+                    prompt = ""
+                    cwd = ""
+                } label: { Label("新建会话", systemImage: "plus") }
+                Button {
+                    resumeId = ""
+                    resumeError = nil
+                    resumeSheet = true
+                } label: { Label("按 Session ID 继续…", systemImage: "arrow.uturn.backward.circle") }
             } label: { Image(systemName: "plus") }
-            .accessibilityLabel("新建会话")
+            .accessibilityLabel("新建或继续会话")
             Button("刷新") { refresh(targetId) }
                 .buttonStyle(.bordered)
                 .controlSize(.regular)
@@ -79,34 +116,131 @@ struct AgentView: View {
         .padding(.horizontal, 12).padding(.vertical, 8)
     }
 
-    private var sessionList: some View {
-        List(sessions) { item in
-            Button {
-                selectedId = item.id
-                creating = false
-            } label: {
-                HStack(spacing: 10) {
-                    Image(systemName: item.state == .running ? "clock" : item.state == .completed ? "checkmark.circle" : "exclamationmark.triangle")
-                        .foregroundStyle(item.state == .running ? .orange : item.state == .completed ? .green : .red)
-                    VStack(alignment: .leading, spacing: 3) {
-                        Text(item.title).foregroundStyle(.primary).lineLimit(1)
-                        Text(item.cwd ?? "~/.link-projects/workspace").font(.caption).foregroundStyle(.secondary).lineLimit(1)
-                    }
-                    Spacer()
-                    Image(systemName: "chevron.right").font(.caption).foregroundStyle(.tertiary)
+    // 会话 ID：点击复制到剪贴板（可粘贴到任意一端「按 Session ID 继续」恢复对话）
+    private func sessionIdRow(_ item: AgentSessionInfo) -> some View {
+        HStack(spacing: 4) {
+            Image(systemName: copiedId ? "checkmark" : "doc.on.doc").font(.caption2)
+            Text(copiedId ? "已复制" : item.sessionId)
+                .font(.system(.caption2, design: .monospaced))
+                .lineLimit(1)
+                .truncationMode(.middle)
+        }
+        .foregroundStyle(.secondary)
+        .contentShape(Rectangle())
+        .onTapGesture {
+            UIPasteboard.general.string = item.sessionId
+            copiedId = true
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) { copiedId = false }
+        }
+        .help("点击复制 Session ID")
+    }
+
+    // 按 Session ID 继续：粘贴任意一端复制的会话 ID，云电脑上仍存在即可接着聊
+    private func resumeSheetView(_ targetId: String) -> some View {
+        NavigationStack {
+            Form {
+                Section {
+                    TextField("Session ID", text: $resumeId)
+                        .font(.system(.callout, design: .monospaced))
+                        .textInputAutocapitalization(.never)
+                        .autocorrectionDisabled()
+                } footer: {
+                    Text("粘贴会话 ID（可从任一端的会话详情点击复制），云电脑上仍存在的会话即可继续对话。")
+                }
+                if let resumeError {
+                    Section { Text(resumeError).font(.footnote).foregroundStyle(.red) }
                 }
             }
-            .swipeActions(edge: .trailing, allowsFullSwipe: false) {
-                Button("删除", role: .destructive) {
-                    deleteCandidate = item
-                    confirmDelete = true
+            .navigationTitle("按 Session ID 继续")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .topBarLeading) {
+                    Button("取消") { resumeSheet = false }.disabled(resuming)
                 }
-                .disabled(item.state == .running)
+                ToolbarItem(placement: .topBarTrailing) {
+                    if resuming {
+                        ProgressView()
+                    } else {
+                        Button("继续") { resumeById(targetId) }
+                            .disabled(resumeId.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                    }
+                }
             }
         }
-        .overlay {
-            if sessions.isEmpty && !loading {
-                ContentUnavailableView("暂无会话", systemImage: "bubble.left.and.bubble.right", description: Text("点击右上角 + 在云电脑创建 Claude Code 会话。"))
+        .interactiveDismissDisabled(resuming)
+    }
+
+    private func resumeById(_ targetId: String) {
+        // 官方会话 ID 为小写 UUID，粘贴大写也能命中
+        let id = resumeId.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard !id.isEmpty else { return }
+        resuming = true
+        resumeError = nil
+        session.agentStatus(targetId: targetId, sessionId: id) { result in
+            resuming = false
+            if let item = result.first {
+                resumeSheet = false
+                scope = .mine
+                applyUpdates([item])
+                selectedId = item.id
+                creating = false
+            } else {
+                resumeError = "云电脑上未找到该会话（可能已被清理或 ID 有误）"
+            }
+        }
+    }
+
+    // Claude 历史列表的状态只由官方 jsonl 决定（存在即完整），不显示本软件的运行状态
+    private func effectiveState(_ item: AgentSessionInfo) -> AgentSessionState {
+        scope == .history ? .completed : item.state
+    }
+
+    private var sessionList: some View {
+        VStack(spacing: 0) {
+            Picker("范围", selection: $scope) {
+                Text("会话").tag(AgentListScope.mine)
+                Text("Claude 历史").tag(AgentListScope.history)
+            }
+            .pickerStyle(.segmented)
+            .padding(.horizontal, 12).padding(.vertical, 6)
+            Divider()
+            List(sessions) { item in
+                Button {
+                    selectedId = item.id
+                    creating = false
+                } label: {
+                    HStack(spacing: 10) {
+                        Image(systemName: effectiveState(item) == .running ? "clock" : effectiveState(item) == .completed ? "checkmark.circle" : "exclamationmark.triangle")
+                            .foregroundStyle(effectiveState(item) == .running ? .orange : effectiveState(item) == .completed ? .green : .red)
+                        VStack(alignment: .leading, spacing: 3) {
+                            Text(item.title).foregroundStyle(.primary).lineLimit(1)
+                            Text(item.cwd ?? "~/.link-projects/workspace").font(.caption).foregroundStyle(.secondary).lineLimit(1)
+                        }
+                        Spacer()
+                        // 「会话」页里标记从 Claude 历史导入的记录
+                        if item.origin == .external && scope == .mine {
+                            Text("外部").font(.caption2).foregroundStyle(.secondary).padding(.horizontal, 5).padding(.vertical, 1).background(Color.cyan.opacity(0.18)).clipShape(Capsule())
+                        }
+                        Image(systemName: "chevron.right").font(.caption).foregroundStyle(.tertiary)
+                    }
+                }
+                .swipeActions(edge: .trailing, allowsFullSwipe: false) {
+                    Button("删除", role: .destructive) {
+                        deleteCandidate = item
+                        confirmDelete = true
+                    }
+                    // History 里的会话由 Claude Code 管理，不能在这里删除
+                    .disabled(item.state == .running || scope == .history)
+                }
+            }
+            .overlay {
+                if sessions.isEmpty && !loading {
+                    ContentUnavailableView(
+                        scope == .history ? "暂无 Claude 历史对话" : "暂无会话",
+                        systemImage: scope == .history ? "clock.arrow.circlepath" : "bubble.left.and.bubble.right",
+                        description: Text(scope == .history ? "云电脑的 Claude Code 输入历史里暂无可恢复的会话" : "点击右上角 + 在云电脑创建 Claude Code 会话。")
+                    )
+                }
             }
         }
     }
@@ -121,22 +255,35 @@ struct AgentView: View {
                         Text(selected.state == .running ? "执行中" : selected.state == .completed ? "已完成" : "失败")
                             .font(.caption).foregroundStyle(.secondary)
                     }
+                    sessionIdRow(selected)
                     if isResponding {
                         HStack(spacing: 8) {
                             ProgressView().controlSize(.small)
-                            Text("Claude Code 正在响应…")
+                            Text("\(selected.agent.displayName) 正在响应…")
                         }
                         .font(.callout).foregroundStyle(.secondary)
                     }
                     if let error = selected.error { Text(error).foregroundStyle(.red) }
                     ForEach(selected.messages) { message in
                         VStack(alignment: .leading, spacing: 3) {
-                            Text(message.role == "user" ? "你" : "Claude Code").font(.caption).foregroundStyle(.secondary)
+                            Text(message.role == "user" ? "你" : selected.agent.displayName).font(.caption).foregroundStyle(.secondary)
                             Text(message.content).frame(maxWidth: .infinity, alignment: .leading)
                         }
                         .padding(10)
                         .background(message.role == "user" ? Color.accentColor.opacity(0.12) : Color.secondary.opacity(0.1))
                         .clipShape(RoundedRectangle(cornerRadius: 8))
+                    }
+                    if let streaming = selected.streaming, !streaming.isEmpty {
+                        VStack(alignment: .leading, spacing: 3) {
+                            Text(selected.agent.displayName).font(.caption).foregroundStyle(.secondary)
+                            Text(streaming).frame(maxWidth: .infinity, alignment: .leading)
+                        }
+                        .padding(10)
+                        .background(Color.secondary.opacity(0.1))
+                        .clipShape(RoundedRectangle(cornerRadius: 8))
+                    } else if selected.state == .running && selected.messages.isEmpty {
+                        // 无增量输出时的占位（官方 jsonl 未落盘、CLI 尚未产出文本）
+                        Text("正在处理…").font(.callout).foregroundStyle(.secondary)
                     }
                 } else {
                     ContentUnavailableView("新建 Claude Code 会话", systemImage: "sparkles", description: Text("默认工作目录为 ~/.link-projects/workspace。"))
@@ -162,9 +309,10 @@ struct AgentView: View {
         }.padding(10)
     }
 
-    // 项目页发起的「新建会话」：切到新建状态并预填工作目录
+    // 项目页发起的「新建会话」：切回「会话」页并预填工作目录
     private func prepareNewSession() {
         guard let initialCwd, !initialCwd.isEmpty else { return }
+        scope = .mine
         selectedId = nil
         creating = true
         prompt = ""
@@ -173,9 +321,17 @@ struct AgentView: View {
 
     private func refresh(_ targetId: String) {
         loading = true
-        session.listAgentSessions(targetId: targetId) { result in
+        session.listAgentSessions(targetId: targetId, scope: scope) { result in
             loading = false; sessions = result
             if selectedId != nil, !result.contains(where: { $0.id == selectedId }) { selectedId = nil; creating = false }
+            else if selectedId != nil { loadDetail(targetId) } // 摘要覆盖了消息，重新拉详情
+        }
+    }
+
+    private func loadDetail(_ targetId: String) {
+        guard let id = selectedId else { return }
+        session.agentStatus(targetId: targetId, sessionId: id) { result in
+            for item in result { applyUpdates([item]) }
         }
     }
 

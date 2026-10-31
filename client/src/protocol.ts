@@ -191,24 +191,41 @@ export interface AgentMessage {
   createdAt: number;
 }
 
+// 会话来源：link = 本软件发起；external = 从 Claude Code 官方记录（history.jsonl + projects jsonl）中发现的外部会话
+export type AgentSessionOrigin = 'link' | 'external';
+
 export interface AgentSession {
   sessionId: string; // Link 内部 ID；claude 同时作为 --session-id / --resume 的 ID
   agent?: AgentKind; // 创建该会话的 CLI；旧记录无此字段视为 claude
   externalId?: string; // codex 的 thread id（exec resume 用）；claude 不需要
+  origin?: AgentSessionOrigin; // 旧记录无此字段视为 link
   title: string;
   cwd?: string;
   state: AgentSessionState;
   createdAt: number;
   updatedAt: number;
   error?: string;
+  // claude 会话对应官方 jsonl（~/.claude/projects/<编码cwd>/<sessionId>.jsonl）的绝对路径。
+  // claude 的消息不再由本软件维护，返回快照时实时从该文件解析；codex 仍由本软件维护 messages。
+  jsonlPath?: string;
+  // 运行中尚未落盘的实时增量文本（仅推送快照携带，不持久化）；UI 显示为生成中的气泡
+  streaming?: string;
+  // 消息视图：claude = 解析官方 jsonl 的结果；codex = 本软件维护的记录。
+  // agent-list 只返回摘要（messages 为空），选中会话后用 agent-status 拉取完整消息。
   messages: AgentMessage[];
 }
 
-// 查询该云电脑本机持久化的会话列表；可在网络恢复后再次请求
+// 会话列表的范围：mine = 本软件发起或继续过对话的会话（默认，含从 history 导入的）；
+// history = 从 Claude Code 官方记录（history.jsonl）发现、尚未在本软件继续过对话的外部会话
+export type AgentListScope = 'mine' | 'history';
+
+// 查询该云电脑本机持久化的会话列表；可在网络恢复后再次请求。
+// scope 缺省为 mine（旧控制端不传即只看本软件的会话）。
 export interface AgentListMsg {
   type: 'agent-list';
   reqId: string;
   targetId: string;
+  scope?: AgentListScope;
 }
 
 // 新建会话（不传 sessionId）或在既有会话中继续对话（传 sessionId）；
@@ -223,7 +240,7 @@ export interface AgentRunMsg {
   agent?: AgentKind;
 }
 
-// 刷新单个会话的状态及完整消息记录
+// 刷新单个会话的状态及完整消息记录（claude 会话的消息在此从官方 jsonl 实时解析）
 export interface AgentStatusMsg {
   type: 'agent-status';
   reqId: string;

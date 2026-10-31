@@ -82,7 +82,7 @@ const LOG_FILE = join(RUNTIME_DIR, 'client.log');
 const AGENT_SESSIONS_FILE = join(RUNTIME_DIR, 'claude-sessions.json');
 const DEFAULT_AGENT_CWD = join(RUNTIME_DIR, 'workspace');
 const agentProcesses = new Map<string, ChildProcess>();
-let agentSessions: AgentSession[] = [];
+let agentSessions: StoredAgentSession[] = [];
 // 项目（常用目录）同样属于云电脑，保存在本机。
 const PROJECTS_FILE = join(RUNTIME_DIR, 'projects.json');
 let projects: Project[] = [];
@@ -400,6 +400,125 @@ function connect() {
 
 // ---------- Agent 会话（Claude Code / Codex CLI） ----------
 
+// Claude Code 官方数据目录：会话本体在 projects/<编码cwd>/<sessionId>.jsonl，
+// 输入历史在 history.jsonl（每行含 sessionId 与 project 原文，是发现外部会话的线索）。
+const CLAUDE_DIR = join(homedir(), '.claude');
+const CLAUDE_HISTORY_FILE = join(CLAUDE_DIR, 'history.jsonl');
+const CLAUDE_PROJECTS_DIR = join(CLAUDE_DIR, 'projects');
+// Claude 历史在列表中最多展示的条数（按最近活动排序），避免历史会话过多拖垮列表与请求耗时
+const MAX_EXTERNAL_SESSIONS = 300;
+
+// 持久化到 claude-sessions.json 的记录：claude 会话不存 messages（复用官方 jsonl），
+// codex 会话仍存（其 rollout 文件格式无官方保证）。协议快照中的 messages 是组装出来的视图。
+type StoredAgentSession = Omit<AgentSession, 'messages' | 'streaming'> & {
+  messages?: AgentSession['messages'];
+  origin?: AgentSession['origin'];
+  jsonlPath?: string;
+};
+
+// cwd -> 官方 projects 子目录名：Claude Code 把路径中所有非字母数字字符替换为 '-'
+function claudeProjectDirName(cwd: string): string {
+  return cwd.replace(/[^a-zA-Z0-9]/g, '-');
+}
+
+// claude 会话对应的官方 jsonl 路径（是否存在由调用方 stat 判断）
+function claudeJsonlPath(cwd: string | undefined, sessionId: string): string | undefined {
+  return cwd ? join(CLAUDE_PROJECTS_DIR, claudeProjectDirName(cwd), `${sessionId}.jsonl`) : undefined;
+}
+
+// 解析官方会话 jsonl 为消息视图：只保留主链路的用户输入与文本回复，
+// 跳过 thinking / tool_use / tool_result / 系统注入（如 token 上限续写提示）等非对话内容，
+// 相邻同角色的文本合并为一条，避免 UI 出现大量碎气泡。
+function parseClaudeJsonl(content: string): AgentSession['messages'] {
+  const messages: AgentSession['messages'] = [];
+  for (const line of content.split('\n')) {
+    if (!line.trim()) continue;
+    let event: any;
+    try {
+      event = JSON.parse(line);
+    } catch {
+      continue;
+    }
+    if (event?.isSidechain) continue;
+    // isMeta = CLI 自己注入的行（如 token 上限续写提示）；新版真实用户输入都带 origin.kind = human
+    if (event?.isMeta) continue;
+    const timestamp = typeof event?.timestamp === 'string' ? Date.parse(event.timestamp) : NaN;
+    const createdAt = Number.isFinite(timestamp) ? timestamp : 0;
+    const message = event?.message;
+    let role: 'user' | 'assistant' | undefined;
+    let text = '';
+    if (event?.type === 'user' && message) {
+      // 用户真实输入：content 为字符串，或数组中的 text 项；tool_result 与系统注入行跳过
+      if (typeof message.content === 'string') {
+        if (event?.origin && event.origin?.kind !== 'human') continue;
+        role = 'user';
+        text = message.content;
+      } else if (Array.isArray(message.content)) {
+        if (message.content.some((item: any) => item?.type === 'tool_result')) continue;
+        text = message.content
+          .filter((item: any) => item?.type === 'text' && typeof item?.text === 'string')
+          .map((item: any) => item.text)
+          .join('\n\n');
+        if (text) role = 'user';
+      }
+    } else if (event?.type === 'assistant' && message && Array.isArray(message.content)) {
+      text = message.content
+        .filter((item: any) => item?.type === 'text' && typeof item?.text === 'string')
+        .map((item: any) => item.text)
+        .join('\n\n');
+      if (text) role = 'assistant';
+    }
+    if (!role || !text.trim()) continue;
+    const last = messages[messages.length - 1];
+    if (last && last.role === role) last.content = `${last.content}\n\n${text}`;
+    else messages.push({ role, content: text, createdAt });
+  }
+  return messages;
+}
+
+// 读取官方 jsonl 并解析消息；文件缺失 / 损坏时返回 undefined（调用方决定回退方式）
+async function readClaudeMessages(jsonlPath: string): Promise<AgentSession['messages'] | undefined> {
+  try {
+    return parseClaudeJsonl(await readFile(jsonlPath, 'utf8'));
+  } catch {
+    return undefined;
+  }
+}
+
+interface ClaudeHistoryEntry {
+  display: string; // 该会话的第一句输入，作为标题
+  project: string; // 会话的工作目录原文（jsonl 目录名由它编码而来）
+  timestamp: number; // 该会话第一次输入的时间
+}
+
+// 解析 ~/.claude/history.jsonl：sessionId -> 会话线索（首句输入 + project 原文）。
+// 旧格式行没有 sessionId，无法恢复会话，直接跳过。
+async function loadClaudeHistoryIndex(): Promise<Map<string, ClaudeHistoryEntry>> {
+  const index = new Map<string, ClaudeHistoryEntry>();
+  let content: string;
+  try {
+    content = await readFile(CLAUDE_HISTORY_FILE, 'utf8');
+  } catch {
+    return index;
+  }
+  for (const line of content.split('\n')) {
+    if (!line.trim()) continue;
+    try {
+      const item = JSON.parse(line);
+      if (typeof item?.sessionId !== 'string' || !item.sessionId) continue;
+      if (typeof item?.project !== 'string' || !item.project) continue;
+      // 同一会话多行输入只保留第一句做标题
+      if (index.has(item.sessionId)) continue;
+      index.set(item.sessionId, {
+        display: typeof item.display === 'string' ? item.display : '',
+        project: item.project,
+        timestamp: typeof item.timestamp === 'number' ? item.timestamp : 0,
+      });
+    } catch { /* 忽略坏行 */ }
+  }
+  return index;
+}
+
 async function loadAgentSessions(): Promise<void> {
   try {
     const parsed = JSON.parse(await readFile(AGENT_SESSIONS_FILE, 'utf8'));
@@ -407,18 +526,29 @@ async function loadAgentSessions(): Promise<void> {
     // 旧记录没有 agent 字段，统一规范化为 claude，后续逻辑不必再判空
     for (const session of agentSessions) {
       if (session.agent !== 'codex') session.agent = 'claude';
+      // 迁移：claude 会话不再维护 messages（复用官方 jsonl），丢弃旧副本并补记 jsonl 路径
+      if (session.agent === 'claude') {
+        delete session.messages;
+        if (!session.jsonlPath) session.jsonlPath = claudeJsonlPath(session.cwd, session.sessionId);
+        // 自愈：旧版把无害的 CLI stderr 噪音（stdin 提示、代理模型名告警）误判为失败，对话实际已成功
+        if (session.state === 'failed' && session.error
+          && /no stdin data received|unrecognized_model/i.test(session.error)) {
+          session.state = 'completed';
+          session.error = undefined;
+        }
+      }
+      if (session.origin !== 'external') session.origin = 'link';
     }
     // client 重启意味着旧 CLI 子进程不可能仍由本实例托管，避免永久显示“运行中”。
-    let changed = false;
     for (const session of agentSessions) {
       if (session.state === 'running') {
         session.state = 'failed';
         session.error = '云电脑客户端已重启，之前的任务状态未知，请继续对话或重新发起任务';
         session.updatedAt = Date.now();
-        changed = true;
       }
     }
-    if (changed) await persistAgentSessions();
+    // 启动仅一次：上面的字段迁移（丢弃旧 messages / 补 jsonlPath）随之落盘
+    await persistAgentSessions();
   } catch (err: any) {
     if (err?.code !== 'ENOENT') console.error(`[agent] 读取会话失败: ${err.message}`);
     agentSessions = [];
@@ -432,23 +562,229 @@ async function persistAgentSessions(): Promise<void> {
   await rename(tmp, AGENT_SESSIONS_FILE);
 }
 
-function agentSnapshot(session: AgentSession): AgentSession {
+function agentSnapshot(session: StoredAgentSession): AgentSession {
   // JSON 往返同时避免调用方意外改写内存中的会话记录。
   return JSON.parse(JSON.stringify(session)) as AgentSession;
 }
 
+// 列表摘要快照：不带消息（消息体量大，选中会话后由 agent-status 拉取详情）
+function summarySnapshot(session: StoredAgentSession): AgentSession {
+  return { ...agentSnapshot(session), messages: [] };
+}
+
+// 运行中的 claude 任务视图：启动时的消息基线 + 本轮输入 + 实时增量文本。
+// 只存在于内存（不落盘），任务结束后以官方 jsonl 解析结果为准。
+const activeRuns = new Map<string, { baseMessages: AgentSession['messages']; prompt: string; streamedText: string }>();
+
+// 运行中快照：基线消息 + 本轮输入（官方 jsonl 写入前的兜底显示）+ streaming 增量
+function runningClaudeSnapshot(session: StoredAgentSession): AgentSession {
+  const run = activeRuns.get(session.sessionId);
+  const messages: AgentSession['messages'] = run
+    ? JSON.parse(JSON.stringify(run.baseMessages))
+    : [];
+  if (run) {
+    const last = messages[messages.length - 1];
+    if (!(last?.role === 'user' && last.content === run.prompt)) {
+      messages.push({ role: 'user', content: run.prompt, createdAt: session.updatedAt });
+    }
+  }
+  const snapshot = { ...agentSnapshot(session), messages };
+  if (run?.streamedText) snapshot.streaming = run.streamedText;
+  else delete snapshot.streaming;
+  return snapshot;
+}
+
+// 详情快照：claude = 实时解析官方 jsonl；codex = 本软件维护的 messages
+async function detailSnapshot(session: StoredAgentSession): Promise<AgentSession> {
+  if (session.agent === 'codex') {
+    return { ...agentSnapshot(session), messages: session.messages ?? [] };
+  }
+  if (session.state === 'running') return runningClaudeSnapshot(session);
+  const messages = session.jsonlPath ? await readClaudeMessages(session.jsonlPath) : undefined;
+  return { ...agentSnapshot(session), messages: messages ?? [] };
+}
+
+// 会话标题：清洗斜杠命令的 XML 标签等噪音，空则回退短 id
+function claudeSessionTitle(text: string, sessionId: string): string {
+  const cleaned = text
+    .replace(/<command-[a-z-]+>[\s\S]*?<\/command-[a-z-]+>/g, ' ')
+    .replace(/<[^>]+>/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+  return (cleaned || `会话 ${sessionId.slice(0, 8)}`).slice(0, 48);
+}
+
+// 由 history 线索 + 官方 jsonl 的 mtime 组装一条外部会话记录
+function externalSessionFromHistory(sessionId: string, entry: ClaudeHistoryEntry, mtimeMs: number): StoredAgentSession {
+  return {
+    sessionId,
+    agent: 'claude',
+    origin: 'external',
+    title: claudeSessionTitle(entry.display, sessionId),
+    cwd: entry.project,
+    state: 'completed',
+    createdAt: entry.timestamp || mtimeMs,
+    updatedAt: mtimeMs,
+    jsonlPath: claudeJsonlPath(entry.project, sessionId),
+  };
+}
+
+// 从 jsonl 头部文本中取第一个带 cwd 的事件行（官方会话几乎每个事件行都带 cwd）
+function firstCwdFromHead(head: string): string | undefined {
+  for (const line of head.split('\n')) {
+    try {
+      const event = JSON.parse(line);
+      if (typeof event?.cwd === 'string' && event.cwd) return event.cwd;
+    } catch { /* 坏行跳过 */ }
+  }
+  return undefined;
+}
+
+// 发现 Claude 历史会话：以磁盘上的官方 jsonl 为准（~/.claude/projects/*/<sessionId>.jsonl），
+// 含 -p 模式发起、history.jsonl 未收录的会话；history.jsonl 仅用于补标题（会话第一句输入）。
+// 只在请求列表时动态生成，不写入 claude-sessions.json；回复不改变此列表
+// （回复后 jsonl 更新，仅排序随之变化），跟踪运行状态的内部记录归「会话」页。
+async function discoverExternalClaudeSessions(): Promise<StoredAgentSession[]> {
+  let dirs;
+  try {
+    dirs = await readdir(CLAUDE_PROJECTS_DIR, { withFileTypes: true });
+  } catch {
+    return [];
+  }
+  // 仅排除本软件发起的会话（正常不会与官方文件重复，防御性排除避免重复展示）
+  const known = new Set(agentSessions.filter((item) => item.origin !== 'external').map((item) => item.sessionId));
+  // 先收集全部候选文件按 mtime 排序，只对最近的一批读头部解析，不为老会话做文件 IO
+  const candidates: { sessionId: string; path: string; mtimeMs: number }[] = [];
+  await Promise.all(dirs.map(async (dir) => {
+    if (!dir.isDirectory()) return;
+    let files;
+    try {
+      files = await readdir(join(CLAUDE_PROJECTS_DIR, dir.name));
+    } catch { return; }
+    await Promise.all(files.map(async (name) => {
+      if (!name.endsWith('.jsonl')) return;
+      const sessionId = name.slice(0, -'.jsonl'.length);
+      if (known.has(sessionId)) return;
+      const path = join(CLAUDE_PROJECTS_DIR, dir.name, name);
+      try {
+        const st = await stat(path);
+        if (st.isFile()) candidates.push({ sessionId, path, mtimeMs: st.mtimeMs });
+      } catch { /* 忽略失效文件 */ }
+    }));
+  }));
+  candidates.sort((a, b) => b.mtimeMs - a.mtimeMs);
+  const history = await loadClaudeHistoryIndex(); // 标题线索：display 为会话第一句输入
+  const found = await Promise.all(candidates.slice(0, MAX_EXTERNAL_SESSIONS).map(async (item) => {
+    const head = readFileHead(item.path, 64 * 1024);
+    const cwd = firstCwdFromHead(head);
+    if (!cwd) return undefined; // 恢复对话依赖 cwd 定位官方会话文件
+    const entry = history.get(item.sessionId);
+    const title = entry?.display
+      ? claudeSessionTitle(entry.display, item.sessionId)
+      : claudeSessionTitle(parseClaudeJsonl(head).find((m) => m.role === 'user')?.content ?? '', item.sessionId);
+    return {
+      sessionId: item.sessionId,
+      agent: 'claude',
+      origin: 'external',
+      title,
+      cwd,
+      state: 'completed',
+      createdAt: entry?.timestamp || item.mtimeMs,
+      updatedAt: item.mtimeMs,
+      jsonlPath: item.path,
+    } as StoredAgentSession;
+  }));
+  return found.filter((item): item is StoredAgentSession => item !== undefined);
+}
+
+// 读取文件头部若干字节（找 cwd / 首条用户输入用，避免为定位元信息读完整大文件）
+function readFileHead(path: string, bytes: number): string {
+  const fd = openSync(path, 'r');
+  try {
+    const buf = Buffer.alloc(bytes);
+    const n = readSync(fd, buf, 0, bytes, 0);
+    return buf.subarray(0, n).toString('utf8');
+  } finally {
+    closeSync(fd);
+  }
+}
+
+// history.jsonl 里没有时的兜底：按 sessionId 直接扫描官方 projects 目录（文件名即 sessionId），
+// 从文件头部定位 cwd 并取首条用户输入做标题。供「按 Session ID 继续」恢复任意仍存在的会话。
+async function findClaudeSessionOnDisk(sessionId: string): Promise<StoredAgentSession | undefined> {
+  // sessionId 用于拼接路径，只放行 UUID 形态字符，杜绝目录穿越
+  if (!/^[0-9a-fA-F-]{8,64}$/.test(sessionId)) return undefined;
+  let dirs;
+  try {
+    dirs = await readdir(CLAUDE_PROJECTS_DIR, { withFileTypes: true });
+  } catch {
+    return undefined;
+  }
+  for (const dir of dirs) {
+    if (!dir.isDirectory()) continue;
+    const jsonlPath = join(CLAUDE_PROJECTS_DIR, dir.name, `${sessionId}.jsonl`);
+    try {
+      const st = await stat(jsonlPath);
+      if (!st.isFile()) continue;
+      const head = readFileHead(jsonlPath, 64 * 1024);
+      const cwd = firstCwdFromHead(head);
+      if (!cwd) continue;
+      const firstUser = parseClaudeJsonl(head).find((item) => item.role === 'user');
+      return {
+        sessionId,
+        agent: 'claude',
+        origin: 'external',
+        title: claudeSessionTitle(firstUser?.content ?? '', sessionId),
+        cwd,
+        state: 'completed',
+        createdAt: st.mtimeMs,
+        updatedAt: st.mtimeMs,
+        jsonlPath,
+      };
+    } catch { /* 该项目目录下无此会话，继续找 */ }
+  }
+  return undefined;
+}
+
+// 查单个外部会话（agent-status / agent-run 复用）；已是内部记录的返回 undefined。
+// history 线索优先（有首句输入做标题），找不到再按 sessionId 扫描磁盘。
+async function findExternalClaudeSession(sessionId: string): Promise<StoredAgentSession | undefined> {
+  if (agentSessions.some((item) => item.sessionId === sessionId)) return undefined;
+  const entry = (await loadClaudeHistoryIndex()).get(sessionId);
+  if (entry) {
+    const jsonlPath = claudeJsonlPath(entry.project, sessionId);
+    if (jsonlPath) {
+      try {
+        const st = await stat(jsonlPath);
+        if (st.isFile()) return externalSessionFromHistory(sessionId, entry, st.mtimeMs);
+      } catch { /* 落到磁盘扫描兜底 */ }
+    }
+  }
+  return findClaudeSessionOnDisk(sessionId);
+}
+
 function replyAgent(reqId: string, targetId: string, sessions: AgentSession[]) {
-  reply({ type: 'agent-sessions', reqId, targetId, sessions: sessions.map(agentSnapshot) });
+  reply({ type: 'agent-sessions', reqId, targetId, sessions });
 }
 
 function handleAgentList(msg: AgentListMsg) {
-  // 最近更新的排在前面，列表不依赖 controller 保留任何状态。
-  replyAgent(msg.reqId, msg.targetId, [...agentSessions].sort((a, b) => b.updatedAt - a.updatedAt));
+  // 最近更新的排在前面；列表不依赖 controller 保留任何状态。
+  void (async () => {
+    // history 页：只看官方记录里发现、尚未在本软件继续过对话的外部会话；
+    // 默认页：本软件的会话记录（含已从 history 导入并继续过的）
+    const list = msg.scope === 'history'
+      ? await discoverExternalClaudeSessions()
+      : [...agentSessions].sort((a, b) => b.updatedAt - a.updatedAt);
+    replyAgent(msg.reqId, msg.targetId, list.map(summarySnapshot));
+  })();
 }
 
 function handleAgentStatus(msg: AgentStatusMsg) {
-  const session = agentSessions.find((item) => item.sessionId === msg.sessionId);
-  replyAgent(msg.reqId, msg.targetId, session ? [session] : []);
+  void (async () => {
+    const session = agentSessions.find((item) => item.sessionId === msg.sessionId)
+      ?? (await findExternalClaudeSession(msg.sessionId));
+    replyAgent(msg.reqId, msg.targetId, session ? [await detailSnapshot(session)] : []);
+  })();
 }
 
 async function handleAgentDelete(msg: AgentDeleteMsg) {
@@ -467,12 +803,20 @@ async function handleAgentDelete(msg: AgentDeleteMsg) {
   }
 }
 
-function handleAgentRun(msg: AgentRunMsg) {
+async function handleAgentRun(msg: AgentRunMsg) {
   const prompt = msg.prompt.trim();
   if (!prompt) return replyAgent(msg.reqId, msg.targetId, []);
 
-  let session: AgentSession | undefined;
+  let session: StoredAgentSession | undefined;
   if (msg.sessionId) session = agentSessions.find((item) => item.sessionId === msg.sessionId);
+  // 内部记录没有但官方记录里有：外部会话首次继续对话，转为内部记录以便跟踪状态
+  if (msg.sessionId && !session) {
+    session = await findExternalClaudeSession(msg.sessionId);
+    if (session) {
+      agentSessions.push(session);
+      console.log(`[agent] 导入外部 Claude Code 会话 ${session.sessionId} (cwd: ${session.cwd})`);
+    }
+  }
   if (msg.sessionId && !session) {
     return reply({ type: 'error', reqId: msg.reqId, message: '找不到该会话（它可能已在云电脑上被删除）' });
   }
@@ -494,28 +838,39 @@ function handleAgentRun(msg: AgentRunMsg) {
       sessionId: randomUUID(),
       // 新建时才采用 msg.agent（缺省 claude）；继续会话时类型以记录为准
       agent: msg.agent === 'codex' ? 'codex' : 'claude',
+      origin: 'link',
       title: prompt.replace(/\s+/g, ' ').slice(0, 48),
       cwd,
       state: 'running',
       createdAt: now,
       updatedAt: now,
-      messages: [],
     };
     agentSessions.push(session);
   } else {
     session.state = 'running';
     session.error = undefined;
     session.updatedAt = now;
-    if (msg.cwd?.trim()) session.cwd = msg.cwd.trim();
+    // 外部会话的 cwd 固定为原会话目录：--resume 依赖它定位 Claude Code 的官方会话文件
+    if (msg.cwd?.trim() && session.origin !== 'external') session.cwd = msg.cwd.trim();
   }
-  session.messages.push({ role: 'user', content: prompt, createdAt: now });
-  persistAgentSessions().catch((err) => console.error(`[agent] 保存会话失败: ${err.message}`));
-  // 立即回 running 快照；网络中断时控制端可稍后用 agent-status / agent-list 拉取最终结果。
-  replyAgent(msg.reqId, msg.targetId, [session]);
-
   // 云电脑 Agent 没有可供用户确认的本地交互界面；显式跳过 CLI 的逐次权限询问，
   // 使其能按用户在控制端发起的任务读取和修改工作目录中的文件。
   const kind: AgentKind = session.agent ?? 'claude';
+  if (kind !== 'codex') {
+    // claude：消息一律以官方 jsonl 为准、本软件不维护；补记路径并缓存本轮运行视图的基线
+    if (!session.jsonlPath) session.jsonlPath = claudeJsonlPath(session.cwd, session.sessionId);
+    const base = session.jsonlPath ? await readClaudeMessages(session.jsonlPath) : undefined;
+    activeRuns.set(session.sessionId, { baseMessages: base ?? [], prompt, streamedText: '' });
+  } else {
+    // codex：仍由本软件维护消息记录（其 rollout 文件格式无官方保证）
+    (session.messages ??= []).push({ role: 'user', content: prompt, createdAt: now });
+  }
+  persistAgentSessions().catch((err) => console.error(`[agent] 保存会话失败: ${err.message}`));
+  // 立即回 running 快照；网络中断时控制端可稍后用 agent-status / agent-list 拉取最终结果。
+  replyAgent(msg.reqId, msg.targetId, [
+    kind === 'codex' ? { ...agentSnapshot(session), messages: session.messages ?? [] } : runningClaudeSnapshot(session),
+  ]);
+
   let file: string;
   let args: string[];
   if (kind === 'codex') {
@@ -540,12 +895,15 @@ function handleAgentRun(msg: AgentRunMsg) {
   let streamBuffer = '';
   let streamedText = '';
   let turnCompleted = false; // codex：收到过 turn.completed 则视为执行成功（stderr 可能有无害杂音）
-  let assistantMessage: AgentSession['messages'][number] | undefined;
   const publishStream = () => {
     session!.updatedAt = Date.now();
-    // 每个增量既主动推送给在线控制端，也写入云电脑；断线时刷新仍可恢复。
-    persistAgentSessions().catch((err) => console.error(`[agent] 保存流式输出失败: ${err.message}`));
-    replyAgent(msg.reqId, msg.targetId, [session!]);
+    // codex 的消息记录在变需要落盘；claude 的增量只存在于内存视图，断线恢复以官方 jsonl 为准。
+    if (kind === 'codex') {
+      persistAgentSessions().catch((err) => console.error(`[agent] 保存流式输出失败: ${err.message}`));
+      replyAgent(msg.reqId, msg.targetId, [{ ...agentSnapshot(session!), messages: session!.messages ?? [] }]);
+    } else {
+      replyAgent(msg.reqId, msg.targetId, [runningClaudeSnapshot(session!)]);
+    }
   };
   const consumeStreamLine = (line: string) => {
     if (!line.trim()) return;
@@ -563,7 +921,7 @@ function handleAgentRun(msg: AgentRunMsg) {
           const text = typeof event?.item?.text === 'string' ? event.item.text : '';
           if (text) {
             // codex 的 item.completed 携带整条消息（无 token 级增量），一次成条
-            session!.messages.push({ role: 'assistant', content: text, createdAt: Date.now() });
+            (session!.messages ??= []).push({ role: 'assistant', content: text, createdAt: Date.now() });
             streamedText += text;
             publishStream();
           }
@@ -575,11 +933,9 @@ function handleAgentRun(msg: AgentRunMsg) {
       const delta = event?.event?.delta;
       const text = delta?.type === 'text_delta' ? delta.text : undefined;
       if (typeof text === 'string' && text) {
-        if (!assistantMessage) {
-          assistantMessage = { role: 'assistant', content: '', createdAt: Date.now() };
-          session!.messages.push(assistantMessage);
-        }
-        assistantMessage.content += text;
+        // claude 增量只进内存运行视图，最终以官方 jsonl 的完整消息为准
+        const run = activeRuns.get(session!.sessionId);
+        if (run) run.streamedText += text;
         streamedText += text;
         publishStream();
       }
@@ -607,29 +963,57 @@ function handleAgentRun(msg: AgentRunMsg) {
     if (streamBuffer) consumeStreamLine(streamBuffer);
     let result = '';
     // claude stream-json 的最终 result 事件带完整结果；仅在未收到文本增量时作为回退，避免重复展示。
+    let resultReported = false; // 是否收到 stream-json 的最终 result 事件（CLI 正常走完输出阶段）
+    let resultIsError = false; // result 事件自身标记的错误
     if (kind !== 'codex') {
       for (const line of stdout.split(/\r?\n/)) {
         try {
           const event = JSON.parse(line);
           if (event.type === 'result') {
-            if (event.is_error) stderr ||= typeof event.result === 'string' ? event.result : 'Claude Code 执行失败';
+            resultReported = true;
+            if (event.is_error) {
+              resultIsError = true;
+              stderr ||= typeof event.result === 'string' ? event.result : 'Claude Code 执行失败';
+            }
             if (typeof event.result === 'string') result = event.result;
           }
         } catch { /* 忽略非 JSON 行 */ }
       }
     }
-    if (!streamedText && result) session!.messages.push({ role: 'assistant', content: result, createdAt: finished });
     session!.updatedAt = finished;
-    // codex 的 stderr 可能带无害运行提示（如工作目录提示），以 turn.completed 为准判成功
-    if (code === 0 && (kind === 'codex' ? turnCompleted || !stderr : !stderr)) {
+    // codex 的 stderr 可能带无害运行提示（如工作目录提示），以 turn.completed 为准判成功；
+    // claude 的 stderr 同样常有无害噪音（stdin 提示、代理模型名告警），收到 result 事件时以它为准，
+    // 仅在 CLI 未走到输出阶段（无 result）时才用 stderr / 退出码兜底判失败。
+    const ok = code === 0 && (kind === 'codex'
+      ? turnCompleted || !stderr
+      : resultReported ? !resultIsError : !stderr);
+    if (ok) {
       session!.state = 'completed';
     } else {
       session!.state = 'failed';
       session!.error = stderr.trim() || `${kind === 'codex' ? 'Codex' : 'Claude Code'} 退出码 ${code ?? '未知'}`;
     }
+    // claude 的最终消息以官方 jsonl 为准；若 jsonl 缺失或尚未包含本轮输入
+    // （CLI 启动失败 / 落盘延迟），回退用本轮运行视图组装，保证控制端不丢本次对话。
+    let finalMessages: AgentSession['messages'] | undefined;
+    if (kind === 'codex') {
+      finalMessages = session!.messages ?? [];
+    } else {
+      const run = activeRuns.get(session!.sessionId);
+      finalMessages = session!.jsonlPath ? await readClaudeMessages(session!.jsonlPath) : undefined;
+      if (run && (finalMessages === undefined || !finalMessages.some((item) => item.role === 'user' && item.content === run.prompt))) {
+        const replyText = run.streamedText || result;
+        finalMessages = [
+          ...run.baseMessages,
+          { role: 'user', content: run.prompt, createdAt: now },
+          ...(replyText ? [{ role: 'assistant' as const, content: replyText, createdAt: finished }] : []),
+        ];
+      }
+      activeRuns.delete(session!.sessionId);
+    }
     try { await persistAgentSessions(); } catch (err: any) { console.error(`[agent] 保存会话失败: ${err.message}`); }
     // 流式阶段已推送 running；退出时必须再推送最终 completed / failed，控制端才能关闭 loading。
-    replyAgent(msg.reqId, msg.targetId, [session!]);
+    replyAgent(msg.reqId, msg.targetId, [{ ...agentSnapshot(session!), messages: finalMessages ?? [] }]);
     console.log(`[agent] 会话 ${session!.sessionId} ${session!.state}`);
   });
 }

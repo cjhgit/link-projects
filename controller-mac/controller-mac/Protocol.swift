@@ -77,6 +77,19 @@ nonisolated enum AgentKind: String, Equatable {
     var displayName: String { self == .codex ? "Codex" : "Claude Code" }
 }
 
+// 会话来源：link = 本软件发起；external = 从 Claude Code 官方记录中发现的外部会话
+nonisolated enum AgentSessionOrigin: String, Equatable {
+    case link
+    case external
+}
+
+// 会话列表范围：mine = 本软件发起或继续过对话的会话（默认）；
+// history = 官方记录里发现、尚未在本软件继续过对话的外部会话
+nonisolated enum AgentListScope: String, Equatable {
+    case mine
+    case history
+}
+
 nonisolated struct AgentMessageInfo: Identifiable, Equatable {
     let role: String
     let content: String
@@ -87,12 +100,16 @@ nonisolated struct AgentMessageInfo: Identifiable, Equatable {
 nonisolated struct AgentSessionInfo: Identifiable, Equatable {
     let sessionId: String
     let agent: AgentKind // 创建该会话的 CLI；旧记录无 agent 字段解析为 claude
+    let origin: AgentSessionOrigin // 旧记录 / 缺省解析为 link
     let title: String
     let cwd: String?
     let state: AgentSessionState
     let createdAt: Double
     let updatedAt: Double
     let error: String?
+    // 运行中尚未落盘的实时增量文本（仅推送快照携带）；与 messages 分开渲染为“生成中”气泡
+    let streaming: String?
+    // agent-list 只返回摘要（messages 为空）；选中会话后由 agent-status 拉取完整消息
     let messages: [AgentMessageInfo]
     var id: String { sessionId }
 }
@@ -253,12 +270,14 @@ nonisolated enum IncomingMessage {
                 AgentSessionInfo(
                     sessionId: item["sessionId"] as? String ?? "",
                     agent: AgentKind(rawValue: item["agent"] as? String ?? "") ?? .claude,
+                    origin: AgentSessionOrigin(rawValue: item["origin"] as? String ?? "") ?? .link,
                     title: item["title"] as? String ?? "未命名会话",
                     cwd: item["cwd"] as? String,
                     state: AgentSessionState(rawValue: item["state"] as? String ?? "") ?? .failed,
                     createdAt: item["createdAt"] as? Double ?? 0,
                     updatedAt: item["updatedAt"] as? Double ?? 0,
                     error: item["error"] as? String,
+                    streaming: item["streaming"] as? String,
                     messages: (item["messages"] as? [[String: Any]] ?? []).map {
                         AgentMessageInfo(role: $0["role"] as? String ?? "assistant", content: $0["content"] as? String ?? "", createdAt: $0["createdAt"] as? Double ?? 0)
                     }
@@ -322,8 +341,8 @@ nonisolated enum OutgoingMessage {
         json(["type": "file-download", "reqId": reqId, "targetId": targetId, "path": path])
     }
 
-    static func agentList(reqId: String, targetId: String) -> String {
-        json(["type": "agent-list", "reqId": reqId, "targetId": targetId])
+    static func agentList(reqId: String, targetId: String, scope: AgentListScope = .mine) -> String {
+        json(["type": "agent-list", "reqId": reqId, "targetId": targetId, "scope": scope.rawValue])
     }
 
     // agent 仅新建会话时传（继续会话时 client 以会话记录保存的类型为准）
